@@ -2,5 +2,4 @@
 todel
 linux/*.tar.gz
 src/solis_and_iog/__pycache__/
-src/solis_and_iog/assets/pyproject.toml
 tests/__pycache__/
