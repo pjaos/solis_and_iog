@@ -177,6 +177,12 @@ class OctopusClient:
             uio.warn(f"Failed to look up Octopus device ID: {exc}")
             return None
 
+    def _is_token_expired(self, data: dict) -> bool:
+        """Return True if the response contains a JWT expiry error."""
+        errors = data.get("errors", [])
+        return any("KT-CT-1124" in e.get("extensions", {}).get("errorCode", "")
+                   for e in errors)
+
     def _get_planned_dispatches(self) -> list[dict]:
         """Return list of planned dispatch dicts from the Octopus API."""
         token = self._get_token()
@@ -197,8 +203,11 @@ class OctopusClient:
                 headers={"Authorization": token},
                 timeout=15,
             )
-            if resp.status_code == 401:
-                # Token may have expired — clear cache and retry once
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Token may have expired — Octopus returns 200 with error body
+            if resp.status_code == 401 or self._is_token_expired(data):
                 uio.debug("Octopus token expired, refreshing.")
                 self._token = None
                 token = self._get_token()
@@ -213,10 +222,11 @@ class OctopusClient:
                     headers={"Authorization": token},
                     timeout=15,
                 )
+                resp.raise_for_status()
+                data = resp.json()
+
             uio.debug(f"Dispatches response status: {resp.status_code}")
             uio.debug(f"Dispatches response body: {resp.text}")
-            resp.raise_for_status()
-            data = resp.json()
             dispatches = data.get("data", {}).get("flexPlannedDispatches", []) or []
             uio.debug(f"Octopus returned {len(dispatches)} planned dispatch(es)")
             return dispatches
