@@ -1,5 +1,5 @@
 """
-oct_int_go_solis_integration.py
+solis_and_iog.py
 ================================
 Monitors Octopus Energy Intelligent Go for extra (outside 23:30-05:30) dispatch
 slots and mirrors them as charge-time windows on a Solis AC-coupled inverter via
