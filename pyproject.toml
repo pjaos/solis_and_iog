@@ -1,6 +1,6 @@
 [project]
 name = "solis_and_iog"
-version = "0.1.2"
+version = "1.0.0"
 description = "A tool to check if your Intelligent Octopus Go account has scheduled an EV charge outside the 23:30-5:30 slot. If this is found to be the case configure your Solis battery system to charge the battery in the scheduled period. This allows use the home battery to be charged during this time on low cost electricity."
 authors = [
     {name = "Paul Austen",email = "pjaos@gmail.com"}
