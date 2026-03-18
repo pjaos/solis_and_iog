@@ -36,6 +36,8 @@ This tool is only useful if you have **all three** of the following:
 
 ## Installation
 
+The python wheel installer file can be found in the linux folder.
+
 ### Using the bundled installer
 
 ```bash
