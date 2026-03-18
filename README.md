@@ -20,8 +20,8 @@ This tool is only useful if you have **all three** of the following:
 
 1. Every 3 minutes (configurable) the tool queries the **Octopus Energy GraphQL API** for planned dispatches.
 2. Any dispatch slot whose start or end falls *outside* the standard 23:30–05:30 off-peak window is treated as an extra intelligent slot.
-3. If the tool is currently inside such a slot and no Solis schedule is active, it writes a charge window into **time slot 3** on the inverter (reserved for this purpose, so slots 1 & 2 for your fixed overnight schedule are untouched).
-4. When the slot ends, the schedule is automatically cleared.
+3. If the tool is currently inside such a slot and no Solis schedule is active, it writes a charge window into **time slot 3** on the Solis inverter (reserved for this purpose, so slots 1 & 2 for your fixed overnight schedule are untouched).
+4. When the slot ends, the Solis schedule is automatically cleared.
 
 ---
 
