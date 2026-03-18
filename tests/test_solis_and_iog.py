@@ -6,12 +6,14 @@ Tests for solis_and_iog.py.
 Run with:
     poetry run pytest -v tests/test_solis_and_iog.py
 """
-
+import requests
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
-from solis_and_iog.solis_and_iog import OctopusClient, SolisClient, ChargeSyncApp
+from solis_and_iog.solis_and_iog import ChargeSyncApp
+from solis_and_iog.octopus import OctopusClient
+from solis_and_iog.solis import SolisClient
 
 
 # ---------------------------------------------------------------------------
@@ -99,13 +101,13 @@ class TestGetToken:
         self.client = make_client()
 
     def test_returns_token_on_success(self):
-        with patch("solis_and_iog.solis_and_iog.requests.post",
+        with patch("solis_and_iog.octopus.requests.post",
                    return_value=mock_response(TOKEN_RESPONSE)):
             token = self.client._get_token()
         assert token == "test-token-abc123"
 
     def test_caches_token_on_second_call(self):
-        with patch("solis_and_iog.solis_and_iog.requests.post",
+        with patch("solis_and_iog.octopus.requests.post",
                    return_value=mock_response(TOKEN_RESPONSE)) as mock_post:
             self.client._get_token()
             self.client._get_token()
@@ -113,20 +115,20 @@ class TestGetToken:
 
     def test_returns_none_when_token_missing_in_response(self):
         resp = {"data": {"obtainKrakenToken": {"token": None}}}
-        with patch("solis_and_iog.solis_and_iog.requests.post",
+        with patch("solis_and_iog.octopus.requests.post",
                    return_value=mock_response(resp)):
             token = self.client._get_token()
         assert token is None
 
     def test_returns_none_on_request_exception(self):
-        with patch("solis_and_iog.solis_and_iog.requests.post",
+        with patch("solis_and_iog.octopus.requests.post",
                    side_effect=Exception("network error")):
             token = self.client._get_token()
         assert token is None
 
     def test_uses_cached_token_without_api_call(self):
         self.client._token = "cached-token"
-        with patch("solis_and_iog.solis_and_iog.requests.post") as mock_post:
+        with patch("solis_and_iog.octopus.requests.post") as mock_post:
             token = self.client._get_token()
         assert token == "cached-token"
         mock_post.assert_not_called()
@@ -143,7 +145,7 @@ class TestGetDeviceId:
         self.client._token = "cached-token"
 
     def test_returns_ev_device_id(self):
-        with patch("solis_and_iog.solis_and_iog.requests.post",
+        with patch("solis_and_iog.octopus.requests.post",
                    return_value=mock_response(DEVICES_RESPONSE)):
             device_id = self.client._get_device_id()
         assert device_id == "device-ev-001"
@@ -157,7 +159,7 @@ class TestGetDeviceId:
                 ]
             }
         }
-        with patch("solis_and_iog.solis_and_iog.requests.post",
+        with patch("solis_and_iog.octopus.requests.post",
                    return_value=mock_response(response)):
             device_id = self.client._get_device_id()
         assert device_id == "device-ev-001"
@@ -170,7 +172,7 @@ class TestGetDeviceId:
                 ]
             }
         }
-        with patch("solis_and_iog.solis_and_iog.requests.post",
+        with patch("solis_and_iog.octopus.requests.post",
                    return_value=mock_response(response)):
             device_id = self.client._get_device_id()
         assert device_id is None
@@ -182,7 +184,7 @@ class TestGetDeviceId:
         assert device_id is None
 
     def test_caches_device_id(self):
-        with patch("solis_and_iog.solis_and_iog.requests.post",
+        with patch("solis_and_iog.octopus.requests.post",
                    return_value=mock_response(DEVICES_RESPONSE)) as mock_post:
             self.client._get_device_id()
             self.client._get_device_id()
@@ -190,13 +192,13 @@ class TestGetDeviceId:
 
     def test_uses_cached_device_id_without_api_call(self):
         self.client._device_id = "cached-device"
-        with patch("solis_and_iog.solis_and_iog.requests.post") as mock_post:
+        with patch("solis_and_iog.octopus.requests.post") as mock_post:
             device_id = self.client._get_device_id()
         assert device_id == "cached-device"
         mock_post.assert_not_called()
 
     def test_returns_none_on_request_exception(self):
-        with patch("solis_and_iog.solis_and_iog.requests.post",
+        with patch("solis_and_iog.octopus.requests.post",
                    side_effect=Exception("network error")):
             device_id = self.client._get_device_id()
         assert device_id is None
@@ -241,7 +243,7 @@ class TestGetPlannedDispatches:
         return {"data": {"flexPlannedDispatches": dispatches}}
 
     def test_returns_empty_list_when_no_dispatches(self):
-        with patch("solis_and_iog.solis_and_iog.requests.post",
+        with patch("solis_and_iog.octopus.requests.post",
                    return_value=mock_response(self._dispatch_response([]))):
             result = self.client._get_planned_dispatches()
         assert result == []
@@ -251,7 +253,7 @@ class TestGetPlannedDispatches:
         dispatches = [
             {"start": now.isoformat(), "end": (now + timedelta(hours=1)).isoformat()}
         ]
-        with patch("solis_and_iog.solis_and_iog.requests.post",
+        with patch("solis_and_iog.octopus.requests.post",
                    return_value=mock_response(self._dispatch_response(dispatches))):
             result = self.client._get_planned_dispatches()
         assert len(result) == 1
@@ -270,7 +272,7 @@ class TestGetPlannedDispatches:
 
     def test_clears_token_on_exception(self):
         self.client._token = "valid-token"
-        with patch("solis_and_iog.solis_and_iog.requests.post",
+        with patch("solis_and_iog.octopus.requests.post",
                    side_effect=Exception("network error")):
             result = self.client._get_planned_dispatches()
         assert result == []
@@ -294,7 +296,7 @@ class TestGetPlannedDispatches:
         mock_resp.text = ""
         mock_resp.json.side_effect = lambda: next(responses)
 
-        with patch("solis_and_iog.solis_and_iog.requests.post", return_value=mock_resp):
+        with patch("solis_and_iog.octopus.requests.post", return_value=mock_resp):
             with patch.object(self.client, "_get_token", return_value="new-token"):
                 self.client._token = "old-token"
                 result = self.client._get_planned_dispatches()
