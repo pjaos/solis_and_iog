@@ -1,6 +1,6 @@
 # solis_and_iog
 
-A tool that bridges **Intelligent Octopus Go** and a **Solis AC-coupled battery inverter**.
+A tool that bridges **Intelligent Octopus Go** and a **Solis battery inverter**.
 
 When Octopus Energy schedules an EV charge *outside* the standard off-peak window (23:30–05:30), this tool detects the extra dispatch slot and automatically programmes the Solis inverter to charge the home battery during that period — letting you take advantage of cheap electricity.
 
