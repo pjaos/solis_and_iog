@@ -3,3 +3,4 @@ todel
 linux/*.tar.gz
 src/solis_and_iog/__pycache__/
 tests/__pycache__/
+linux/*.tar.gz
