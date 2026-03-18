@@ -2,7 +2,7 @@
 
 A tool that bridges **Intelligent Octopus Go** and a **Solis AC-coupled battery inverter**.
 
-When Octopus Energy schedules an EV charge *outside* the standard off-peak window (23:30–05:30), this tool detects the extra dispatch slot and automatically programmes the Solis inverter to charge the home battery during that period — letting you take advantage of cheap electricity even when your EV isn't drawing power.
+When Octopus Energy schedules an EV charge *outside* the standard off-peak window (23:30–05:30), this tool detects the extra dispatch slot and automatically programmes the Solis inverter to charge the home battery during that period — letting you take advantage of cheap electricity.
 
 ---
 
@@ -27,7 +27,7 @@ This tool is only useful if you have **all three** of the following:
 
 ## Prerequisites
 
-- Python **3.12** or later
+- Python **3.11.2** or later
 - A **SolisCloud API Key ID and Secret** — request access at the [Solis support portal](https://solis-service.solisinverters.com/en/support/solutions/articles/44002212561)
 - An **Octopus Energy API key** — available in your Octopus account dashboard
 - **"Allow Grid Charging"** must be enabled on your inverter (via the SolisCloud app or the inverter display)
@@ -107,24 +107,6 @@ solis_and_iog -e /home/auser/charge_sync_app.env --enable_auto_start
 
 ---
 
-## Running with Docker (optional)
-
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY solis_and_iog-*.whl .
-RUN pip install solis_and_iog-*.whl
-COPY charge_sync_app.env .
-CMD ["solis_and_iog", "-e", "/app/charge_sync_app.env"]
-```
-
-```bash
-docker build -t solis_and_iog .
-docker run -d --restart unless-stopped solis_and_iog
-```
-
----
-
 ## Project structure
 
 ```
@@ -152,7 +134,6 @@ solis_and_iog/
 ## Security notes
 
 - Keep your `.env` file private — it contains API secrets. Do **not** commit it to version control.
-- Add `*.env` to your `.gitignore`.
 - The SolisCloud API uses HMAC-SHA1 signed requests; your secret is never sent in plain text.
 
 ---
@@ -172,7 +153,7 @@ Confirm that "Allow Grid Charging" is enabled on the inverter. Also check that `
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE.txt) for details.
 
 ---
 
