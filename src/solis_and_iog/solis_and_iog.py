@@ -59,6 +59,10 @@ class ChargeSyncApp:
         self._slot_active  = False
         self._active_end:  datetime | None = None
 
+        # Limit the Octopus API usage
+        if self.poll_interval < 60:
+            self.poll_interval = 60
+
     def _info(self, msg):
         if self._uio:
             self._uio.info(f"Octopus API: {msg}")
