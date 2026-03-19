@@ -6,7 +6,7 @@ Tests for solis_and_iog.py.
 Run with:
     poetry run pytest -v tests/test_solis_and_iog.py
 """
-import requests
+
 import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
