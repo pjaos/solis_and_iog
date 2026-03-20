@@ -103,7 +103,7 @@ solis_and_iog -e /home/auser/charge_sync_app.env
 
 ### Running as a service
 
-Use the built-in boot manager to have the tool start automatically:
+Use the built-in boot manager to have the tool start automatically (Linux only):
 
 ```bash
 solis_and_iog -e /home/auser/charge_sync_app.env --enable_auto_start
@@ -118,6 +118,8 @@ solis_and_iog/
 ├── src/
 │   └── solis_and_iog/
 │       └── solis_and_iog.py   # Main application
+|       └── solis.py           # solis API interface
+|       └── octopus.py         # Octopus API interface
 ├── install.py                 # Cross-platform installer
 ├── pyproject.toml
 └── README.md
@@ -132,6 +134,7 @@ solis_and_iog/
 | `requests` | HTTP calls to Octopus and SolisCloud APIs |
 | `python-dotenv` | Loading credentials from the `.env` file |
 | `p3lib` | Logging, boot manager, and CLI utilities |
+| 'pytest' | Python test framework |
 
 ---
 
