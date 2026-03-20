@@ -27,6 +27,7 @@ This tool is only useful if you have **all three** of the following:
 
 ## Prerequisites
 
+- Hardware to run the app on. I have tested it on a Raspberry Pi 2 W but it should run on any Linux, windows or MAC machine that meets the python requirements.
 - Python **3.11.2** or later
 - A **SolisCloud API Key ID and Secret** — request access at the [Solis support portal](https://solis-service.solisinverters.com/en/support/solutions/articles/44002212561)
 - An **Octopus Energy API key** — available in your Octopus account dashboard
