@@ -36,11 +36,11 @@ class OctopusClient:
                  offpeak_start: tuple[int, int] = (23, 30),
                  offpeak_end:   tuple[int, int] = (5,  30),
                  uio = None):
-        self._uio            = uio
         self.api_key        = api_key
         self.account_number = account_number
         self.offpeak_start  = offpeak_start
         self.offpeak_end    = offpeak_end
+        self._uio            = uio
         self._token:        str | None = None
         self._device_id:    str | None = None
 
@@ -192,7 +192,9 @@ class OctopusClient:
             self._debug(f"Dispatches response status: {resp.status_code}")
             self._debug(f"Dispatches response body: {resp.text}")
             dispatches = data.get("data", {}).get("flexPlannedDispatches", []) or []
-            self._debug(f"Octopus returned {len(dispatches)} planned dispatch(es)")
+            now = datetime.now()
+            now_str = now.astimezone().strftime("%H:%M:%S %d:%m:%Y")
+            self._debug(f"Octopus returned {len(dispatches)} planned dispatch(es): at {now_str} (local time).")
             return dispatches
         except Exception as exc:
             self._warn(f"Failed to fetch Octopus dispatches: {exc}")
