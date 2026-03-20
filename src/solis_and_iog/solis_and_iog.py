@@ -107,7 +107,7 @@ class ChargeSyncApp:
                 self._active_end = end
 
         else:
-            self._debug(f"Dispatch still active until {self.solis.fmt_time(end)}.")
+            self._info(f"Dispatch still active until {self.solis.fmt_time(end)}.")
 
     def _handle_no_dispatch(self) -> None:
         if self._slot_active:
@@ -116,7 +116,7 @@ class ChargeSyncApp:
                 self._slot_active = False
                 self._active_end  = None
         else:
-            self._debug("No extra dispatch. Sleeping.")
+            self._info("No extra dispatch. Sleeping.")
 
     @staticmethod
     def create_template_env_file(uio):
