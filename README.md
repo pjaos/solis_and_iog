@@ -64,7 +64,7 @@ All credentials are supplied via a `.env` file. Generate a template with:
 solis_and_iog -c
 ```
 
-This creates `/home/auser/charge_sync_app.env`. Open it and fill in your details:
+This creates `/home/auser/solis_and_iog.env`. Open it and fill in your details:
 
 ```env
 OCTOPUS_API_KEY=sk_live_XXXXXXXXXXXXXXXXXXXXXXXX
@@ -87,7 +87,7 @@ SOLIS_INVERTER_SN=XXXXXXXXXXXXXXX
 ## Usage
 
 ```bash
-solis_and_iog -e /home/auser/charge_sync_app.env
+solis_and_iog -e /home/auser/solis_and_iog.env
 ```
 
 ### Command-line options
@@ -106,7 +106,7 @@ solis_and_iog -e /home/auser/charge_sync_app.env
 Use the built-in boot manager to have the tool start automatically (Linux only):
 
 ```bash
-solis_and_iog -e /home/auser/charge_sync_app.env --enable_auto_start
+solis_and_iog -e /home/auser/solis_and_iog.env --enable_auto_start
 ```
 
 ---

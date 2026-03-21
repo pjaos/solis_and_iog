@@ -121,7 +121,7 @@ class ChargeSyncApp:
     @staticmethod
     def create_template_env_file(uio):
         home = Path.home()
-        template_env_file = os.path.join(home, 'charge_sync_app.env')
+        template_env_file = os.path.join(home, 'solis_and_iog.env')
         if os.path.isfile(template_env_file):
             raise Exception(f'{template_env_file} file already present.')
 
