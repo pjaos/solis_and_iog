@@ -214,35 +214,44 @@ class OctopusClient:
         Return True if the slot extends outside the standard off-peak window,
         meaning Octopus has added an extra cheap slot specifically for the EV.
 
-        Checks that the slot is entirely contained within 23:30-05:30, not just
-        that both endpoints appear to fall within the window. For example, a slot
-        running 23:00-06:00 has endpoints that look in-range but actually extends
-        outside the window on both sides.
+        The off-peak window spans midnight (e.g. 23:30-05:30), so naive
+        time-of-day comparisons break down.  Instead we work on a linear
+        minute axis anchored to the off-peak start:
+
+          - minute 0   = off-peak start  (e.g. 23:30)
+          - minute 360 = off-peak end    (e.g. 05:30, i.e. 6 h later)
+          - any minute outside [0, window_len] is outside the window
+
+        Both endpoints are converted to local time first so that the
+        comparison is made against the locally-observed off-peak hours
+        regardless of the UTC offset of the incoming datetimes.
         """
         local_start = start.astimezone()
         local_end   = end.astimezone()
 
-        def to_minutes(t: datetime) -> int:
-            """Convert a time to minutes since midnight."""
-            return t.hour * 60 + t.minute
+        op_start_mins = self.offpeak_start[0] * 60 + self.offpeak_start[1]
+        op_end_mins   = self.offpeak_end[0]   * 60 + self.offpeak_end[1]
 
-        def slot_contained_in_offpeak(s: datetime, e: datetime) -> bool:
-            """
-            Return True only if the entire slot falls within the off-peak window.
-            Checks that the slot doesn't start before off-peak begins AND doesn't
-            end after off-peak ends.
-            """
-            s_mins   = to_minutes(s)
-            e_mins   = to_minutes(e)
-            op_start = self.offpeak_start[0] * 60 + self.offpeak_start[1]  # e.g. 23:30 = 1410
-            op_end   = self.offpeak_end[0]   * 60 + self.offpeak_end[1]    # e.g. 05:30 =  330
+        # Length of the off-peak window in minutes, accounting for midnight wrap.
+        # e.g. 23:30 -> 05:30  =  (330 - 1410 + 1440) % 1440  =  360 mins
+        window_len = (op_end_mins - op_start_mins) % (24 * 60)
 
-            # Start must be at or after 23:30, or past midnight but before/at 05:30
-            start_ok = s_mins >= op_start or s_mins <= op_end
-            # End must be at or before 05:30
-            end_ok   = e_mins <= op_end
-            return start_ok and end_ok
+        def minutes_into_window(dt: datetime) -> int:
+            """
+            Return how many minutes after op_start this datetime falls,
+            on a linear [0, 1439] scale that wraps at midnight.
+            A value in [0, window_len] means the time is inside the window;
+            a value > window_len means it is outside.
+            """
+            dt_mins = dt.hour * 60 + dt.minute
+            return (dt_mins - op_start_mins) % (24 * 60)
+
+        start_offset = minutes_into_window(local_start)
+        end_offset   = minutes_into_window(local_end)
+
+        # The slot is contained if both endpoints lie within [0, window_len].
+        slot_contained = start_offset <= window_len and end_offset <= window_len
 
         # If the slot is entirely within the standard overnight window,
         # the battery's fixed schedule already handles it — skip it.
-        return not slot_contained_in_offpeak(local_start, local_end)
+        return not slot_contained

@@ -20,16 +20,29 @@ from solis_and_iog.solis import SolisClient
 # Helpers
 # ---------------------------------------------------------------------------
 
-def utc(hour: int, minute: int) -> datetime:
-    """Return a UTC-aware datetime for today at the given hour:minute."""
-    return datetime.now(timezone.utc).replace(
+# The local timezone of the test host, captured once at import time.
+LOCAL_TZ = datetime.now().astimezone().tzinfo
+
+
+def local_dt(hour: int, minute: int, date_offset: int = 0) -> datetime:
+    """
+    Return a timezone-aware datetime for today at hour:minute in LOCAL time.
+
+    _is_outside_offpeak calls .astimezone() on its inputs before comparing
+    them against the off-peak window (which is defined in local clock time).
+    Supplying local-aware datetimes means .astimezone() is a no-op, so the
+    hour:minute values survive the conversion unchanged on any host regardless
+    of its UTC offset.
+    """
+    base = datetime.now(LOCAL_TZ).replace(
         hour=hour, minute=minute, second=0, microsecond=0
     )
+    return base + timedelta(days=date_offset)
 
 
-def make_client() -> OctopusClient:
+def make_client(**kwargs) -> OctopusClient:
     """Return an OctopusClient with default off-peak window (23:30-05:30)."""
-    return OctopusClient(api_key="test_key", account_number="A-TEST1234")
+    return OctopusClient(api_key="test_key", account_number="A-TEST1234", **kwargs)
 
 
 def make_dispatch(start: datetime, end: datetime) -> dict:
@@ -307,49 +320,164 @@ class TestGetPlannedDispatches:
 # ===========================================================================
 # OctopusClient._is_outside_offpeak
 # ===========================================================================
+#
+# DESIGN NOTE — why local_dt() is used here
+# ------------------------------------------
+# _is_outside_offpeak calls .astimezone() on its inputs to convert them to the
+# host's local time before comparing against the off-peak window (which is
+# always specified in local clock time).
+#
+# Tests in TestIsOutsideOffpeak use local_dt(), which builds datetimes that are
+# already in local time, so .astimezone() is a no-op and hour:minute values
+# survive unchanged on any host regardless of UTC offset.
+#
+# TestIsOutsideOffpeakUTCInputs exercises the UTC→local conversion path
+# explicitly, simulating real Octopus API timestamps.
+# ===========================================================================
 
 class TestIsOutsideOffpeak:
+    """Local-time inputs — window arithmetic tested directly."""
 
     def setup_method(self):
-        self.client = make_client()
+        self.client = make_client()  # default window: 23:30 – 05:30
+
+    # --- slots wholly inside the off-peak window (expect False) ---
 
     def test_exact_offpeak_window_is_not_outside(self):
-        assert self.client._is_outside_offpeak(utc(23, 30), utc(5, 30)) is False
+        """Full window 23:30→05:30 is exactly the off-peak period."""
+        assert self.client._is_outside_offpeak(local_dt(23, 30), local_dt(5, 30)) is False
 
     def test_slot_wholly_within_offpeak_after_midnight(self):
-        assert self.client._is_outside_offpeak(utc(0, 0), utc(5, 0)) is False
+        """00:00→05:00 is entirely after midnight, inside the window."""
+        assert self.client._is_outside_offpeak(local_dt(0, 0), local_dt(5, 0)) is False
 
     def test_slot_starts_at_offpeak_start(self):
-        assert self.client._is_outside_offpeak(utc(23, 30), utc(4, 0)) is False
+        """23:30→04:00 starts exactly at the window boundary."""
+        assert self.client._is_outside_offpeak(local_dt(23, 30), local_dt(4, 0)) is False
 
     def test_slot_ends_at_offpeak_end(self):
-        assert self.client._is_outside_offpeak(utc(1, 0), utc(5, 30)) is False
+        """01:00→05:30 ends exactly at the window boundary."""
+        assert self.client._is_outside_offpeak(local_dt(1, 0), local_dt(5, 30)) is False
+
+    def test_slot_in_middle_of_window(self):
+        """02:00→03:00 is well inside the window."""
+        assert self.client._is_outside_offpeak(local_dt(2, 0), local_dt(3, 0)) is False
+
+    def test_single_minute_slot_at_window_start_is_inside(self):
+        """23:30→23:31 — a tiny slot right at the opening of the window."""
+        assert self.client._is_outside_offpeak(local_dt(23, 30), local_dt(23, 31)) is False
+
+    # --- slots that stray outside the off-peak window (expect True) ---
+
+    def test_slot_starts_one_minute_before_offpeak(self):
+        """23:29→05:00 starts one minute before the window opens."""
+        assert self.client._is_outside_offpeak(local_dt(23, 29), local_dt(5, 0)) is True
 
     def test_slot_starts_before_offpeak(self):
-        assert self.client._is_outside_offpeak(utc(23, 0), utc(5, 30)) is True
+        """23:00→05:30 starts half an hour before the window."""
+        assert self.client._is_outside_offpeak(local_dt(23, 0), local_dt(5, 30)) is True
+
+    def test_slot_ends_one_minute_after_offpeak(self):
+        """00:00→05:31 ends one minute after the window closes."""
+        assert self.client._is_outside_offpeak(local_dt(0, 0), local_dt(5, 31)) is True
 
     def test_slot_ends_after_offpeak(self):
-        assert self.client._is_outside_offpeak(utc(23, 30), utc(6, 0)) is True
+        """23:30→06:00 ends after the window."""
+        assert self.client._is_outside_offpeak(local_dt(23, 30), local_dt(6, 0)) is True
 
     def test_slot_spans_beyond_offpeak_on_both_sides(self):
-        assert self.client._is_outside_offpeak(utc(23, 0), utc(6, 0)) is True
+        """23:00→06:00 extends outside the window on both sides."""
+        assert self.client._is_outside_offpeak(local_dt(23, 0), local_dt(6, 0)) is True
 
     def test_daytime_slot_is_outside(self):
-        assert self.client._is_outside_offpeak(utc(12, 0), utc(13, 0)) is True
+        """12:00→13:00 is in the middle of the day."""
+        assert self.client._is_outside_offpeak(local_dt(12, 0), local_dt(13, 0)) is True
 
     def test_early_morning_slot_past_offpeak_end(self):
-        assert self.client._is_outside_offpeak(utc(5, 30), utc(7, 0)) is True
+        """05:30→07:00: starts at window end, runs past it."""
+        assert self.client._is_outside_offpeak(local_dt(5, 30), local_dt(7, 0)) is True
 
     def test_evening_slot_before_offpeak_start(self):
-        assert self.client._is_outside_offpeak(utc(20, 0), utc(22, 0)) is True
+        """20:00→22:00 is in the evening before the window opens."""
+        assert self.client._is_outside_offpeak(local_dt(20, 0), local_dt(22, 0)) is True
 
-    def test_custom_offpeak_window(self):
-        client = OctopusClient(
-            api_key="k", account_number="A-TEST",
-            offpeak_start=(22, 0), offpeak_end=(6, 0),
-        )
-        assert client._is_outside_offpeak(utc(22, 0), utc(6, 0)) is False
-        assert client._is_outside_offpeak(utc(21, 0), utc(6, 0)) is True
+    def test_single_minute_slot_just_before_window_start_is_outside(self):
+        """23:29→23:30 is one minute before the window opens."""
+        assert self.client._is_outside_offpeak(local_dt(23, 29), local_dt(23, 30)) is True
+
+    # --- custom off-peak window ---
+
+    def test_custom_offpeak_window_contained(self):
+        """Custom 22:00→06:00 window: exact window should not be outside."""
+        client = make_client(offpeak_start=(22, 0), offpeak_end=(6, 0))
+        assert client._is_outside_offpeak(local_dt(22, 0), local_dt(6, 0)) is False
+
+    def test_custom_offpeak_window_slot_inside(self):
+        """Custom 22:00→06:00 window: 00:00→05:00 is inside."""
+        client = make_client(offpeak_start=(22, 0), offpeak_end=(6, 0))
+        assert client._is_outside_offpeak(local_dt(0, 0), local_dt(5, 0)) is False
+
+    def test_custom_offpeak_window_slot_starts_before(self):
+        """Custom 22:00→06:00 window: 21:00→06:00 starts before it."""
+        client = make_client(offpeak_start=(22, 0), offpeak_end=(6, 0))
+        assert client._is_outside_offpeak(local_dt(21, 0), local_dt(6, 0)) is True
+
+    def test_custom_offpeak_window_slot_ends_after(self):
+        """Custom 22:00→06:00 window: 22:00→07:00 ends after it."""
+        client = make_client(offpeak_start=(22, 0), offpeak_end=(6, 0))
+        assert client._is_outside_offpeak(local_dt(22, 0), local_dt(7, 0)) is True
+
+
+class TestIsOutsideOffpeakUTCInputs:
+    """
+    Pass genuine UTC datetimes (as the real Octopus API returns) into
+    _is_outside_offpeak.  The method must convert them correctly to local time
+    before comparing against the off-peak window.
+
+    We build UTC datetimes by converting known local times to UTC, then
+    passing those UTC datetimes back in.  This round-trip is timezone-agnostic
+    and equivalent to what happens in production.
+    """
+
+    def setup_method(self):
+        self.client = make_client()  # default window: 23:30 – 05:30
+
+    def _local_as_utc(self, hour: int, minute: int, date_offset: int = 0) -> datetime:
+        """Return the UTC equivalent of the given local hour:minute."""
+        return local_dt(hour, minute, date_offset).astimezone(timezone.utc)
+
+    def test_standard_offpeak_utc_timestamps_not_outside(self):
+        """
+        A dispatch from local 23:30 today to local 05:30 tomorrow, expressed
+        as UTC timestamps, must not be flagged as an extra slot.
+        """
+        start_utc = self._local_as_utc(23, 30)
+        end_utc   = self._local_as_utc(5, 30, date_offset=1)
+        assert self.client._is_outside_offpeak(start_utc, end_utc) is False
+
+    def test_utc_slot_inside_offpeak_not_outside(self):
+        """A mid-window UTC slot (local 01:00→04:00) is inside the window."""
+        start_utc = self._local_as_utc(1, 0)
+        end_utc   = self._local_as_utc(4, 0)
+        assert self.client._is_outside_offpeak(start_utc, end_utc) is False
+
+    def test_utc_slot_ending_after_offpeak_is_outside(self):
+        """A UTC slot ending at local 06:00 tomorrow overruns the window."""
+        start_utc = self._local_as_utc(23, 30)
+        end_utc   = self._local_as_utc(6, 0, date_offset=1)
+        assert self.client._is_outside_offpeak(start_utc, end_utc) is True
+
+    def test_utc_slot_starting_before_offpeak_is_outside(self):
+        """A UTC slot starting at local 23:00 begins before the window opens."""
+        start_utc = self._local_as_utc(23, 0)
+        end_utc   = self._local_as_utc(5, 30, date_offset=1)
+        assert self.client._is_outside_offpeak(start_utc, end_utc) is True
+
+    def test_utc_daytime_slot_is_outside(self):
+        """A UTC slot at local 14:00→15:00 is nowhere near the off-peak window."""
+        start_utc = self._local_as_utc(14, 0)
+        end_utc   = self._local_as_utc(15, 0)
+        assert self.client._is_outside_offpeak(start_utc, end_utc) is True
 
 
 # ===========================================================================
@@ -383,6 +511,10 @@ class TestFindActiveExtraDispatch:
         assert self.client.find_active_extra_dispatch() is None
 
     def test_returns_none_for_active_in_window_dispatch(self):
+        """
+        A dispatch that is currently active but falls entirely within the
+        standard off-peak window should be ignored.
+        """
         now   = datetime.now(timezone.utc)
         start = now.replace(hour=23, minute=30, second=0, microsecond=0)
         if start > now:
@@ -684,7 +816,7 @@ class TestChargeSyncAppPoll:
         assert app._active_end == new_dispatch["end"]
 
     def test_full_dispatch_lifecycle(self):
-        """Simulate: detect -> active -> ends -> cleared."""
+        """Simulate: detect -> active -> still active -> ends -> cleared."""
         app, octopus, solis = make_app()
         dispatch = self._dispatch()
 
