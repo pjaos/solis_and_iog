@@ -15,9 +15,10 @@ class SolisClient:
     Responsible for reading and writing charge time slots on the inverter.
     """
 
-    CONTROL_PATH = "/v2/api/control"
-    READ_PATH    = "/v2/api/atRead"
-    SCHEDULE_CID = "103"
+    CONTROL_PATH        = "/v2/api/control"
+    READ_PATH           = "/v2/api/atRead"
+    INVERTER_DETAIL_PATH = "/v1/api/inverterDetail"
+    SCHEDULE_CID        = "103"
 
     def __init__(self, key_id: str, key_secret: str, inverter_sn: str,
                  api_url: str = "https://www.soliscloud.com:13333",
@@ -97,6 +98,37 @@ class SolisClient:
         else:
             self._error(f"Solis clear returned unexpected response: {result}")
         return success
+
+    def get_battery_charge_power(self) -> float | None:
+        """
+        Return the current battery charge power in watts.
+
+        Queries the SolisCloud inverterDetail endpoint, which returns a
+        'batteryPower' field in kW.  The sign convention used by Solis is:
+            positive  → battery is charging
+            negative  → battery is discharging
+
+        Returns the value converted to watts, or None if the API call fails
+        or the field is absent from the response.
+        """
+        result = self._post(self.INVERTER_DETAIL_PATH, {
+            "sn": self.inverter_sn,
+        })
+        data = result.get("data")
+        if not data:
+            self._warn("inverterDetail returned no data — cannot read battery power.")
+            return None
+        battery_power_kw = data.get("batteryPower")
+        if battery_power_kw is None:
+            self._warn("inverterDetail response contains no batteryPower field.")
+            return None
+        try:
+            watts = float(battery_power_kw) * 1000
+        except (TypeError, ValueError) as exc:
+            self._warn(f"Could not convert batteryPower value {battery_power_kw!r} to float: {exc}")
+            return None
+        self._info(f"Battery charge power: {watts:.0f} W (raw: {battery_power_kw} kW)")
+        return watts
 
     # ------------------------------------------------------------------
     # Private helpers — API communication

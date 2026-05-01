@@ -67,6 +67,10 @@ class ChargeSyncApp:
         if self._uio:
             self._uio.info(f"Octopus API: {msg}")
 
+    def _warn(self, msg):
+        if self._uio:
+            self._uio.warn(f"Octopus API: {msg}")
+
     def _debug(self, msg):
         if self._uio:
             self._uio.debug(f"Octopus API: {msg}")
@@ -109,14 +113,27 @@ class ChargeSyncApp:
         else:
             self._info(f"Dispatch still active until {self.solis.fmt_time(end)}.")
 
+        self._log_battery_charge_power()
+
     def _handle_no_dispatch(self) -> None:
         if self._slot_active:
             self._info("No active extra dispatch — clearing Solis charge slot.")
             if self.solis.clear_charge_slot():
                 self._slot_active = False
                 self._active_end  = None
+                self._log_battery_charge_power()
         else:
             self._info("No extra dispatch. Sleeping.")
+
+    def _log_battery_charge_power(self) -> None:
+        """Fetch and log the current battery charge power from the Solis inverter."""
+        try:
+            watts = self.solis.get_battery_charge_power()
+            if watts is not None:
+                direction = "charging" if watts > 0 else ("discharging" if watts < 0 else "idle")
+                self._info(f"Battery charge power: {watts:.0f} W ({direction})")
+        except Exception as exc:
+            self._warn(f"Could not read battery charge power: {exc}")
 
     @staticmethod
     def create_template_env_file(uio):

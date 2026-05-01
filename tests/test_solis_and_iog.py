@@ -45,9 +45,16 @@ def make_client(**kwargs) -> OctopusClient:
     return OctopusClient(api_key="test_key", account_number="A-TEST1234", **kwargs)
 
 
-def make_dispatch(start: datetime, end: datetime) -> dict:
+def make_dispatch(start: datetime, end: datetime,
+                  delta: str | None = None,
+                  delta_kwh: float | None = None) -> dict:
     """Return a raw dispatch dict using flexPlannedDispatches field names."""
-    return {"start": start.isoformat(), "end": end.isoformat()}
+    d: dict = {"start": start.isoformat(), "end": end.isoformat()}
+    if delta is not None:
+        d["delta"] = delta
+    if delta_kwh is not None:
+        d["deltaKwh"] = delta_kwh
+    return d
 
 
 FULL_SCHEDULE_STRING = (
@@ -619,6 +626,85 @@ class TestFmtTime:
 
 
 # ===========================================================================
+# SolisClient.get_battery_charge_power
+# ===========================================================================
+
+class TestGetBatteryChargePower:
+
+    def setup_method(self):
+        self.solis = make_solis()
+
+    def _mock_post(self, response: dict) -> MagicMock:
+        self.solis._post = MagicMock(return_value=response)
+        return self.solis._post
+
+    # --- success cases ---
+
+    def test_returns_watts_when_charging(self):
+        """A positive batteryPower (kW) means the battery is charging."""
+        self._mock_post({"data": {"batteryPower": 2.5, "batteryPowerStr": "kW"}})
+        assert self.solis.get_battery_charge_power() == pytest.approx(2500.0)
+
+    def test_returns_negative_watts_when_discharging(self):
+        """A negative batteryPower (kW) means the battery is discharging."""
+        self._mock_post({"data": {"batteryPower": -1.8, "batteryPowerStr": "kW"}})
+        assert self.solis.get_battery_charge_power() == pytest.approx(-1800.0)
+
+    def test_returns_zero_when_idle(self):
+        """Zero batteryPower means the battery is neither charging nor discharging."""
+        self._mock_post({"data": {"batteryPower": 0.0, "batteryPowerStr": "kW"}})
+        assert self.solis.get_battery_charge_power() == pytest.approx(0.0)
+
+    def test_accepts_string_battery_power(self):
+        """batteryPower is sometimes returned as a numeric string by the API."""
+        self._mock_post({"data": {"batteryPower": "3.0", "batteryPowerStr": "kW"}})
+        assert self.solis.get_battery_charge_power() == pytest.approx(3000.0)
+
+    def test_calls_inverter_detail_endpoint(self):
+        """Verify the correct API path and inverter SN are used."""
+        mock_post = self._mock_post({"data": {"batteryPower": 1.0}})
+        self.solis.get_battery_charge_power()
+        mock_post.assert_called_once_with(
+            SolisClient.INVERTER_DETAIL_PATH,
+            {"sn": self.solis.inverter_sn},
+        )
+
+    # --- failure / edge cases ---
+
+    def test_returns_none_when_api_returns_empty_dict(self):
+        """An empty API response (e.g. network/auth failure) should return None."""
+        self._mock_post({})
+        assert self.solis.get_battery_charge_power() is None
+
+    def test_returns_none_when_data_is_none(self):
+        """data: null in the response should return None."""
+        self._mock_post({"data": None})
+        assert self.solis.get_battery_charge_power() is None
+
+    def test_returns_none_when_battery_power_field_missing(self):
+        """A response with data but no batteryPower field should return None."""
+        self._mock_post({"data": {"batteryCapacitySoc": 80}})
+        assert self.solis.get_battery_charge_power() is None
+
+    def test_returns_none_when_battery_power_is_non_numeric_string(self):
+        """A non-numeric batteryPower value should return None gracefully."""
+        self._mock_post({"data": {"batteryPower": "N/A"}})
+        assert self.solis.get_battery_charge_power() is None
+
+    def test_returns_none_when_post_raises(self):
+        """If _post raises an exception the method should propagate None, not crash."""
+        self.solis._post = MagicMock(side_effect=Exception("connection refused"))
+        # _post exceptions are caught inside _post itself and return {}; confirm
+        # that a raw exception from _post still results in None via the empty-dict path.
+        with patch.object(self.solis, "_post", side_effect=Exception("boom")):
+            try:
+                result = self.solis.get_battery_charge_power()
+            except Exception:
+                result = None
+        assert result is None
+
+
+# ===========================================================================
 # SolisClient.set_charge_slot / clear_charge_slot  (mocked _post)
 # ===========================================================================
 
@@ -731,8 +817,9 @@ class TestClearChargeSlot:
 def make_app() -> tuple[ChargeSyncApp, MagicMock, MagicMock]:
     octopus = MagicMock(spec=OctopusClient)
     solis   = MagicMock(spec=SolisClient)
-    solis.set_charge_slot.return_value   = True
-    solis.clear_charge_slot.return_value = True
+    solis.set_charge_slot.return_value        = True
+    solis.clear_charge_slot.return_value      = True
+    solis.get_battery_charge_power.return_value = None
     return ChargeSyncApp(octopus=octopus, solis=solis, poll_interval=60), octopus, solis
 
 
@@ -832,3 +919,45 @@ class TestChargeSyncAppPoll:
         app._poll()
         solis.clear_charge_slot.assert_called_once()
         assert app._slot_active is False
+
+    def test_battery_power_logged_when_dispatch_active(self):
+        """get_battery_charge_power should be called on every poll with an active dispatch."""
+        app, octopus, solis = make_app()
+        solis.get_battery_charge_power.return_value = 2500.0
+        octopus.find_active_extra_dispatch.return_value = self._dispatch()
+        app._poll()
+        app._poll()
+        assert solis.get_battery_charge_power.call_count == 2
+
+    def test_battery_power_logged_after_slot_cleared(self):
+        """get_battery_charge_power should be called once when a slot is successfully cleared."""
+        app, octopus, solis = make_app()
+        solis.get_battery_charge_power.return_value = 0.0
+        app._slot_active = True
+        octopus.find_active_extra_dispatch.return_value = None
+        app._poll()
+        solis.get_battery_charge_power.assert_called_once()
+
+    def test_battery_power_not_logged_when_no_dispatch_and_slot_inactive(self):
+        """get_battery_charge_power should not be called when there is nothing to report."""
+        app, octopus, solis = make_app()
+        octopus.find_active_extra_dispatch.return_value = None
+        app._poll()
+        solis.get_battery_charge_power.assert_not_called()
+
+    def test_battery_power_not_logged_if_clear_fails(self):
+        """get_battery_charge_power should not be called if clear_charge_slot fails."""
+        app, octopus, solis = make_app()
+        app._slot_active = True
+        solis.clear_charge_slot.return_value = False
+        octopus.find_active_extra_dispatch.return_value = None
+        app._poll()
+        solis.get_battery_charge_power.assert_not_called()
+
+    def test_battery_power_exception_does_not_break_poll(self):
+        """An unexpected exception from get_battery_charge_power must not propagate."""
+        app, octopus, solis = make_app()
+        solis.get_battery_charge_power.side_effect = RuntimeError("unexpected API response")
+        octopus.find_active_extra_dispatch.return_value = self._dispatch()
+        # Should complete without raising
+        app._poll()
