@@ -56,8 +56,9 @@ class ChargeSyncApp:
         self.solis         = solis
         self.poll_interval = poll_interval
         self._uio          = uio
-        self._slot_active  = False
-        self._active_end:  datetime | None = None
+        self._slot_active   = False
+        self._active_start: datetime | None = None
+        self._active_end:   datetime | None = None
 
         # Limit the Octopus API usage
         if self.poll_interval < 60:
@@ -97,18 +98,21 @@ class ChargeSyncApp:
             self._handle_no_dispatch()
 
     def _handle_active_dispatch(self, dispatch: dict) -> None:
-        end = dispatch["end"]
+        start = dispatch["start"]
+        end   = dispatch["end"]
 
         if not self._slot_active:
-            self._info(f'Extra dispatch detected: {self.solis.fmt_time(dispatch["start"])} -> {self.solis.fmt_time(end)}')
-            if self.solis.set_charge_slot(dispatch["start"], end):
-                self._slot_active = True
-                self._active_end  = end
+            self._info(f"Extra dispatch detected: {self.solis.fmt_time(start)} -> {self.solis.fmt_time(end)}")
+            if self.solis.set_charge_slot(start, end):
+                self._slot_active  = True
+                self._active_start = start
+                self._active_end   = end
 
-        elif self._active_end != end:
-            self._info(f"Dispatch end time changed to {self.solis.fmt_time(end)}, updating Solis.")
-            if self.solis.set_charge_slot(dispatch["start"], end):
-                self._active_end = end
+        elif self._active_start != start or self._active_end != end:
+            self._info(f"Dispatch times changed to {self.solis.fmt_time(start)} -> {self.solis.fmt_time(end)}, updating Solis.")
+            if self.solis.set_charge_slot(start, end):
+                self._active_start = start
+                self._active_end   = end
 
         else:
             self._info(f"Dispatch still active until {self.solis.fmt_time(end)}.")
@@ -119,8 +123,9 @@ class ChargeSyncApp:
         if self._slot_active:
             self._info("No active extra dispatch — clearing Solis charge slot.")
             if self.solis.clear_charge_slot():
-                self._slot_active = False
-                self._active_end  = None
+                self._slot_active  = False
+                self._active_start = None
+                self._active_end   = None
                 self._log_battery_charge_power()
         else:
             self._info("No extra dispatch. Sleeping.")

@@ -850,8 +850,9 @@ class TestChargeSyncAppPoll:
         app._slot_active = True
         octopus.find_active_extra_dispatch.return_value = None
         app._poll()
-        assert app._slot_active is False
-        assert app._active_end  is None
+        assert app._slot_active  is False
+        assert app._active_start is None
+        assert app._active_end   is None
 
     def test_slot_remains_active_if_clear_fails(self):
         app, octopus, solis = make_app()
@@ -872,8 +873,9 @@ class TestChargeSyncAppPoll:
         dispatch = self._dispatch()
         octopus.find_active_extra_dispatch.return_value = dispatch
         app._poll()
-        assert app._slot_active is True
-        assert app._active_end  == dispatch["end"]
+        assert app._slot_active  is True
+        assert app._active_start == dispatch["start"]
+        assert app._active_end   == dispatch["end"]
 
     def test_slot_not_marked_active_if_set_fails(self):
         app, octopus, solis = make_app()
@@ -885,8 +887,9 @@ class TestChargeSyncAppPoll:
     def test_already_active_same_end_does_not_call_set_again(self):
         app, octopus, solis = make_app()
         dispatch = self._dispatch()
-        app._slot_active = True
-        app._active_end  = dispatch["end"]
+        app._slot_active  = True
+        app._active_start = dispatch["start"]
+        app._active_end   = dispatch["end"]
         octopus.find_active_extra_dispatch.return_value = dispatch
         app._poll()
         solis.set_charge_slot.assert_not_called()
@@ -895,12 +898,14 @@ class TestChargeSyncAppPoll:
         app, octopus, solis = make_app()
         dispatch     = self._dispatch(minutes_ahead=30)
         new_dispatch = {**dispatch, "end": dispatch["end"] + timedelta(minutes=15)}
-        app._slot_active = True
-        app._active_end  = dispatch["end"]
+        app._slot_active  = True
+        app._active_start = dispatch["start"]
+        app._active_end   = dispatch["end"]
         octopus.find_active_extra_dispatch.return_value = new_dispatch
         app._poll()
         solis.set_charge_slot.assert_called_once()
-        assert app._active_end == new_dispatch["end"]
+        assert app._active_start == new_dispatch["start"]
+        assert app._active_end   == new_dispatch["end"]
 
     def test_full_dispatch_lifecycle(self):
         """Simulate: detect -> active -> still active -> ends -> cleared."""
@@ -909,7 +914,9 @@ class TestChargeSyncAppPoll:
 
         octopus.find_active_extra_dispatch.return_value = dispatch
         app._poll()
-        assert app._slot_active is True
+        assert app._slot_active  is True
+        assert app._active_start == dispatch["start"]
+        assert app._active_end   == dispatch["end"]
         solis.set_charge_slot.assert_called_once()
 
         app._poll()
@@ -918,7 +925,55 @@ class TestChargeSyncAppPoll:
         octopus.find_active_extra_dispatch.return_value = None
         app._poll()
         solis.clear_charge_slot.assert_called_once()
-        assert app._slot_active is False
+        assert app._slot_active  is False
+        assert app._active_start is None
+        assert app._active_end   is None
+
+    def test_already_active_changed_start_updates_slot(self):
+        """If only the dispatch start time changes, the Solis slot must be updated."""
+        app, octopus, solis = make_app()
+        now = datetime.now(timezone.utc)
+        original   = {"start": now - timedelta(minutes=10),
+                      "end":   now + timedelta(minutes=30), "raw": {}}
+        rescheduled = {"start": now - timedelta(minutes=5),   # start moved forward
+                       "end":   original["end"], "raw": {}}
+        app._slot_active  = True
+        app._active_start = original["start"]
+        app._active_end   = original["end"]
+        octopus.find_active_extra_dispatch.return_value = rescheduled
+        app._poll()
+        solis.set_charge_slot.assert_called_once()
+        assert app._active_start == rescheduled["start"]
+        assert app._active_end   == rescheduled["end"]
+
+    def test_already_active_unchanged_times_does_not_update_slot(self):
+        """No API call when both start and end are identical to what Solis already has."""
+        app, octopus, solis = make_app()
+        dispatch = self._dispatch()
+        app._slot_active  = True
+        app._active_start = dispatch["start"]
+        app._active_end   = dispatch["end"]
+        octopus.find_active_extra_dispatch.return_value = dispatch
+        app._poll()
+        solis.set_charge_slot.assert_not_called()
+
+    def test_already_active_changed_start_set_fails_does_not_update_state(self):
+        """If set_charge_slot fails on a start-time change, tracked times must not advance."""
+        app, octopus, solis = make_app()
+        solis.set_charge_slot.return_value = False
+        now = datetime.now(timezone.utc)
+        original   = {"start": now - timedelta(minutes=10),
+                      "end":   now + timedelta(minutes=30), "raw": {}}
+        rescheduled = {"start": now - timedelta(minutes=5),
+                       "end":   original["end"], "raw": {}}
+        app._slot_active  = True
+        app._active_start = original["start"]
+        app._active_end   = original["end"]
+        octopus.find_active_extra_dispatch.return_value = rescheduled
+        app._poll()
+        # State must remain at the original times so the next poll retries.
+        assert app._active_start == original["start"]
+        assert app._active_end   == original["end"]
 
     def test_battery_power_logged_when_dispatch_active(self):
         """get_battery_charge_power should be called on every poll with an active dispatch."""
