@@ -195,6 +195,16 @@ class OctopusClient:
             now = datetime.now()
             now_str = now.astimezone().strftime("%H:%M:%S %d:%m:%Y")
             self._debug(f"Octopus returned {len(dispatches)} planned dispatch(es): at {now_str} (local time).")
+            # The raw body logged above shows the API's UTC timestamps. Log a
+            # local-time rendering of each slot as well so the offset (e.g. +1h
+            # for BST) is obvious when reading the log. This is purely for
+            # readability — the dispatch dicts are returned unchanged.
+            if self._uio:
+                for i, d in enumerate(dispatches, 1):
+                    self._debug(
+                        f"  Dispatch {i} (local time): "
+                        f"{self._local_str(d.get('start'))} -> {self._local_str(d.get('end'))}"
+                    )
             return dispatches
         except Exception as exc:
             self._warn(f"Failed to fetch Octopus dispatches: {exc}")
@@ -208,6 +218,19 @@ class OctopusClient:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
+
+    def _local_str(self, dt_str: str | None) -> str:
+        """
+        Render an ISO-8601 dispatch timestamp in host-local time for logging,
+        e.g. "2026-06-28 13:30:00 BST". Used only for human-readable log output.
+
+        Never raises: a malformed or missing value yields a placeholder string
+        so that logging can't take down the polling loop.
+        """
+        try:
+            return self._parse_dt(dt_str).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        except (TypeError, ValueError):
+            return f"<unparseable {dt_str!r}>"
 
     def _is_outside_offpeak(self, start: datetime, end: datetime) -> bool:
         """
