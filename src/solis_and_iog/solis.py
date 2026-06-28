@@ -186,16 +186,46 @@ class SolisClient:
         Format: charge_current, discharge_current, then per slot (4 fields):
             charge_start-charge_end, discharge_start-discharge_end,
             charge_enable, discharge_enable
+
+        Returns None on failure. Callers MUST treat None as "do not write",
+        because writing a schedule derived from a failed read would wipe the
+        inverter's existing slots.
         """
         result = self._post(self.READ_PATH, {
             "inverterSn": self.inverter_sn,
             "cid":        self.SCHEDULE_CID,
         })
-        raw = result.get("data", {}).get("msg", "")
+
+        # _post() returns {} on ANY request/HTTP error (timeout, connection
+        # reset, 5xx, bad JSON). Previously this fell through to the "blank
+        # defaults" branch below, so a transient read failure produced an
+        # all-zero schedule that was then written back to the inverter,
+        # wiping the user's other charge/discharge slots.
+        if not result:
+            self._error("Failed to read current Solis schedule (no response) — aborting.")
+            return None
+
+        # Extract the schedule string. 'data' may be present but null, so
+        # guard with `or {}`. If we got a response but no usable schedule
+        # string, abort rather than fabricate a blank schedule: writing blank
+        # defaults back to the inverter is exactly what wipes existing slots.
+        # The poll loop will simply retry on the next cycle.
+        raw = (result.get("data") or {}).get("msg", "")
         if not raw:
-            self._warn("Empty schedule response from Solis, using blank defaults.")
-            raw = "50,60,00:00-00:00,00:00-00:00,0,0,00:00-00:00,00:00-00:00,0,0,00:00-00:00,00:00-00:00,0,0"
-        return self._parse_value_string(raw)
+            self._error("Solis schedule read returned no schedule data — aborting "
+                        "to avoid overwriting existing slots.")
+            return None
+
+        # Parsing can fail if the API returns a malformed or unexpected value
+        # (e.g. a non-string msg, or junk in a field). Treat that exactly like
+        # a failed read: abort the write and let the next poll retry, rather
+        # than letting the exception propagate and crash the polling loop.
+        try:
+            return self._parse_value_string(raw)
+        except Exception as exc:
+            self._error(f"Could not parse Solis schedule {raw!r}: {exc} — aborting "
+                        "to avoid overwriting existing slots.")
+            return None
 
     @staticmethod
     def _parse_value_string(value: str) -> dict:
