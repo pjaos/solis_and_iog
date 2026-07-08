@@ -8,11 +8,20 @@ the SolisCloud Control API.
 How it works:
     1. Every POLL_INTERVAL seconds the Octopus GraphQL API is queried for
        plannedDispatches.
-    2. Any dispatch slot whose start OR end falls outside the standard off-peak
-       window (23:30-05:30) is considered an "intelligent" extra slot.
-    3. If we are currently inside such a slot and no Solis schedule is active,
-       one is created (charge time slot 3, which we reserve for this purpose).
-    4. When the slot ends the schedule is cleared.
+    2. Contiguous / overlapping dispatch slots are merged into single windows
+       (Octopus splits continuous charging periods into 30-minute settlement
+       chunks, e.g. 12:30-13:00 + 13:00-13:30 becomes 12:30-13:30).
+    3. Any merged window whose start OR end falls outside the standard
+       off-peak window (23:30-05:30) is considered an "intelligent" extra slot.
+    4. The Solis charge slot is written PROACTIVELY as soon as the window is
+       known (active or upcoming), so the inverter's own clock starts and
+       stops the charge with no polling-latency gap. The poll loop's job is
+       just to keep the written window in sync with Octopus's latest plan.
+    5. Sleeps are adaptive: when a window start, internal chunk boundary, or
+       window end is nearer than POLL_INTERVAL, the loop wakes a few seconds
+       after that boundary to re-verify the plan (these are the moments a
+       reschedule is most likely), then clears the slot promptly after the
+       window ends.
 
 SolisCloud API notes:
     - You need a SolisCloud API Key ID and Secret. Request access at:
@@ -28,7 +37,7 @@ SolisCloud API notes:
 import argparse
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from p3lib.uio import UIO
 from p3lib.helper import logTraceBack
@@ -49,6 +58,16 @@ class ChargeSyncApp:
     charge schedule in sync.
     """
 
+    # Wake this many seconds after a window start / boundary / end so the
+    # Octopus API has had a moment to reflect any reschedule.
+    BOUNDARY_WAKE_DELAY_S = 5
+    # Never sleep less than this, even when boundaries are imminent.
+    MIN_SLEEP_S = 10
+    # Solis charge slots are HH:MM only (no date). A window starting >= ~24h
+    # away must not be written yet, or the inverter would activate it at the
+    # wrong day's occurrence of that HH:MM. Keep a 60s safety margin.
+    PROACTIVE_HORIZON_S = 24 * 3600 - 60
+
     def __init__(self, octopus: OctopusClient, solis: SolisClient,
                  poll_interval: int = 180,
                  uio = None):
@@ -56,9 +75,14 @@ class ChargeSyncApp:
         self.solis         = solis
         self.poll_interval = poll_interval
         self._uio          = uio
-        self._slot_active   = False
-        self._active_start: datetime | None = None
-        self._active_end:   datetime | None = None
+        # State of what we have written to the inverter (the window may be
+        # upcoming rather than active — slots are written proactively).
+        self._slot_written  = False
+        self._written_start: datetime | None = None
+        self._written_end:   datetime | None = None
+        # Internal chunk boundaries of the currently-written merged window,
+        # used by the adaptive sleep to re-verify the plan at risky moments.
+        self._boundaries:    list[datetime] = []
 
         # Limit the Octopus API usage
         if self.poll_interval < 60:
@@ -82,7 +106,9 @@ class ChargeSyncApp:
         self._info(f"Account: {self.octopus.account_number} | Inverter: {self.solis.inverter_sn} | Slot: {self.solis.time_slot} | Poll: {self.poll_interval}s")
         while True:
             self._poll()
-            time.sleep(self.poll_interval)
+            sleep_s = self._next_sleep()
+            self._debug(f"Sleeping {sleep_s:.0f}s until next poll.")
+            time.sleep(sleep_s)
 
     # ------------------------------------------------------------------
     # Private
@@ -90,45 +116,114 @@ class ChargeSyncApp:
 
     def _poll(self) -> None:
         """Single poll iteration."""
-        dispatch = self.octopus.find_active_extra_dispatch()
+        dispatch = self.octopus.find_relevant_extra_dispatch()
 
         if dispatch:
-            self._handle_active_dispatch(dispatch)
+            self._handle_dispatch(dispatch)
         else:
             self._handle_no_dispatch()
 
-    def _handle_active_dispatch(self, dispatch: dict) -> None:
+    def _handle_dispatch(self, dispatch: dict) -> None:
+        """
+        Keep the Solis charge slot in sync with the active or upcoming merged
+        dispatch window. The slot is written proactively (before the window
+        starts) so the inverter's own clock opens and closes the charge with
+        no polling-latency gap.
+        """
+        now   = datetime.now(timezone.utc)
         start = dispatch["start"]
         end   = dispatch["end"]
 
-        if not self._slot_active:
-            self._info(f"Extra dispatch detected: {self.solis.fmt_time(start)} -> {self.solis.fmt_time(end)}")
-            if self.solis.set_charge_slot(start, end):
-                self._slot_active  = True
-                self._active_start = start
-                self._active_end   = end
+        # Solis slots carry HH:MM only. A window starting >= ~24h away would
+        # match the wrong day's occurrence of that HH:MM if written now, so
+        # hold off — the normal polling cadence will pick it up in time.
+        if (start - now).total_seconds() >= self.PROACTIVE_HORIZON_S:
+            self._info(f"Upcoming dispatch {self.solis.fmt_time(start)} -> {self.solis.fmt_time(end)} "
+                       f"is more than 24h away — deferring slot write.")
+            if self._slot_written:
+                self._clear_written_slot()
+            return
 
-        elif self._active_start != start or self._active_end != end:
-            self._info(f"Dispatch times changed to {self.solis.fmt_time(start)} -> {self.solis.fmt_time(end)}, updating Solis.")
+        active = start <= now <= end
+        state  = "active" if active else "upcoming"
+
+        if not self._slot_written:
+            self._info(f"Extra dispatch window detected ({state}): "
+                       f"{self.solis.fmt_time(start)} -> {self.solis.fmt_time(end)}")
             if self.solis.set_charge_slot(start, end):
-                self._active_start = start
-                self._active_end   = end
+                self._slot_written  = True
+                self._written_start = start
+                self._written_end   = end
+                self._boundaries    = list(dispatch.get("boundaries", []))
+
+        elif self._written_start != start or self._written_end != end:
+            self._info(f"Dispatch window changed to {self.solis.fmt_time(start)} -> "
+                       f"{self.solis.fmt_time(end)} ({state}), updating Solis.")
+            if self.solis.set_charge_slot(start, end):
+                self._written_start = start
+                self._written_end   = end
+                self._boundaries    = list(dispatch.get("boundaries", []))
 
         else:
-            self._info(f"Dispatch still active until {self.solis.fmt_time(end)}.")
+            # Window unchanged; refresh boundaries in case chunk joins moved
+            # without the overall window changing.
+            self._boundaries = list(dispatch.get("boundaries", []))
+            self._info(f"Dispatch window unchanged ({state}), "
+                       f"{self.solis.fmt_time(start)} -> {self.solis.fmt_time(end)}.")
 
-        self._log_battery_charge_power()
+        if active:
+            self._log_battery_charge_power()
 
     def _handle_no_dispatch(self) -> None:
-        if self._slot_active:
-            self._info("No active extra dispatch — clearing Solis charge slot.")
-            if self.solis.clear_charge_slot():
-                self._slot_active  = False
-                self._active_start = None
-                self._active_end   = None
-                self._log_battery_charge_power()
+        if self._slot_written:
+            self._info("No active or upcoming extra dispatch — clearing Solis charge slot.")
+            self._clear_written_slot()
         else:
             self._info("No extra dispatch. Sleeping.")
+
+    def _clear_written_slot(self) -> None:
+        """Clear the Solis slot and reset written-window state on success."""
+        if self.solis.clear_charge_slot():
+            self._slot_written  = False
+            self._written_start = None
+            self._written_end   = None
+            self._boundaries    = []
+            self._log_battery_charge_power()
+
+    def _next_sleep(self) -> float:
+        """
+        Return how long to sleep before the next poll.
+
+        Normally poll_interval. But when a boundary of the written window
+        (its start, an internal chunk join, or its end) is nearer than
+        poll_interval, wake BOUNDARY_WAKE_DELAY_S seconds after the earliest
+        such boundary instead:
+
+          - just after START:      verify the dispatch still exists (Octopus
+                                   may have cancelled it at short notice —
+                                   otherwise the battery grid-charges at peak
+                                   rate until the next poll noticed).
+          - just after a BOUNDARY: verify the remainder of the merged window
+                                   still exists (a future chunk can be
+                                   shortened or dropped).
+          - just after END:        clear the Solis slot promptly.
+        """
+        if not self._slot_written:
+            return self.poll_interval
+
+        now = datetime.now(timezone.utc)
+        upcoming: list[float] = []
+        for dt in (self._written_start, *self._boundaries, self._written_end):
+            if dt is None:
+                continue
+            delta = (dt - now).total_seconds()
+            if delta > 0:
+                upcoming.append(delta + self.BOUNDARY_WAKE_DELAY_S)
+
+        candidates = [s for s in upcoming if s < self.poll_interval]
+        if candidates:
+            return max(min(candidates), self.MIN_SLEEP_S)
+        return self.poll_interval
 
     def _log_battery_charge_power(self) -> None:
         """Fetch and log the current battery charge power from the Solis inverter."""

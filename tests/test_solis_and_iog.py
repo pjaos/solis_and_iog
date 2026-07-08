@@ -488,10 +488,138 @@ class TestIsOutsideOffpeakUTCInputs:
 
 
 # ===========================================================================
-# OctopusClient.find_active_extra_dispatch
+# OctopusClient._merge_dispatches
 # ===========================================================================
 
-class TestFindActiveExtraDispatch:
+def utc_dt(hour: int, minute: int = 0, day_offset: int = 0) -> datetime:
+    """A fixed, timezone-aware UTC datetime for pure merge-logic tests."""
+    return datetime(2026, 7, 8, hour, minute, tzinfo=timezone.utc) + timedelta(days=day_offset)
+
+
+class TestMergeDispatches:
+    """_merge_dispatches is a pure function — no client state or time needed."""
+
+    def test_empty_list_returns_empty(self):
+        assert OctopusClient._merge_dispatches([]) == []
+
+    def test_single_slot_unchanged_no_boundaries(self):
+        w = OctopusClient._merge_dispatches([(utc_dt(12, 30), utc_dt(13, 0))])
+        assert len(w) == 1
+        assert w[0]["start"]      == utc_dt(12, 30)
+        assert w[0]["end"]        == utc_dt(13, 0)
+        assert w[0]["boundaries"] == []
+
+    def test_back_to_back_slots_merge_into_one_window(self):
+        """The originally reported case: 12:30-13:00 + 13:00-13:30."""
+        w = OctopusClient._merge_dispatches([
+            (utc_dt(12, 30), utc_dt(13, 0)),
+            (utc_dt(13, 0),  utc_dt(13, 30)),
+        ])
+        assert len(w) == 1
+        assert w[0]["start"] == utc_dt(12, 30)
+        assert w[0]["end"]   == utc_dt(13, 30)
+
+    def test_join_point_recorded_as_boundary(self):
+        w = OctopusClient._merge_dispatches([
+            (utc_dt(12, 30), utc_dt(13, 0)),
+            (utc_dt(13, 0),  utc_dt(13, 30)),
+        ])
+        assert w[0]["boundaries"] == [utc_dt(13, 0)]
+
+    def test_three_contiguous_chunks_merge_with_two_boundaries(self):
+        w = OctopusClient._merge_dispatches([
+            (utc_dt(12, 30), utc_dt(13, 0)),
+            (utc_dt(13, 0),  utc_dt(13, 30)),
+            (utc_dt(13, 30), utc_dt(14, 0)),
+        ])
+        assert len(w) == 1
+        assert w[0]["end"]        == utc_dt(14, 0)
+        assert w[0]["boundaries"] == [utc_dt(13, 0), utc_dt(13, 30)]
+
+    def test_small_gap_within_tolerance_merges(self):
+        """A 45s sliver between slots (Octopus does this) still merges."""
+        w = OctopusClient._merge_dispatches([
+            (utc_dt(12, 30), utc_dt(13, 0)),
+            (utc_dt(13, 0) + timedelta(seconds=45), utc_dt(13, 30)),
+        ])
+        assert len(w) == 1
+
+    def test_gap_beyond_tolerance_stays_separate(self):
+        w = OctopusClient._merge_dispatches([
+            (utc_dt(12, 30), utc_dt(13, 0)),
+            (utc_dt(13, 0) + timedelta(seconds=90), utc_dt(13, 30)),
+        ])
+        assert len(w) == 2
+
+    def test_distinct_windows_not_merged(self):
+        w = OctopusClient._merge_dispatches([
+            (utc_dt(12, 30), utc_dt(13, 0)),
+            (utc_dt(15, 0),  utc_dt(15, 30)),
+        ])
+        assert len(w) == 2
+        assert w[0]["end"]   == utc_dt(13, 0)
+        assert w[1]["start"] == utc_dt(15, 0)
+
+    def test_unsorted_input_is_sorted_before_merging(self):
+        w = OctopusClient._merge_dispatches([
+            (utc_dt(13, 0),  utc_dt(13, 30)),
+            (utc_dt(12, 30), utc_dt(13, 0)),
+        ])
+        assert len(w) == 1
+        assert w[0]["start"] == utc_dt(12, 30)
+        assert w[0]["end"]   == utc_dt(13, 30)
+
+    def test_fully_contained_slot_absorbed_without_extending(self):
+        """A slot inside an existing window must not extend it or add a boundary."""
+        w = OctopusClient._merge_dispatches([
+            (utc_dt(12, 30), utc_dt(13, 30)),
+            (utc_dt(12, 45), utc_dt(13, 0)),
+        ])
+        assert len(w) == 1
+        assert w[0]["end"]        == utc_dt(13, 30)
+        assert w[0]["boundaries"] == []
+
+    def test_overlapping_slot_extends_window(self):
+        w = OctopusClient._merge_dispatches([
+            (utc_dt(12, 30), utc_dt(13, 10)),
+            (utc_dt(13, 0),  utc_dt(13, 30)),
+        ])
+        assert len(w) == 1
+        assert w[0]["end"] == utc_dt(13, 30)
+
+    def test_merge_spanning_midnight(self):
+        """Chunks either side of midnight merge into one window."""
+        w = OctopusClient._merge_dispatches([
+            (utc_dt(23, 30), utc_dt(0, 0, day_offset=1)),
+            (utc_dt(0, 0, day_offset=1), utc_dt(0, 30, day_offset=1)),
+        ])
+        assert len(w) == 1
+        assert w[0]["start"] == utc_dt(23, 30)
+        assert w[0]["end"]   == utc_dt(0, 30, day_offset=1)
+
+
+# ===========================================================================
+# OctopusClient.find_relevant_extra_dispatch
+# ===========================================================================
+#
+# DESIGN NOTE — time-of-day-independent dispatch construction
+# ------------------------------------------------------------
+# These tests run against the real clock, so a dispatch built relative to
+# "now" lands at a different local time depending on when the suite runs.
+# Whether a slot is "outside off-peak" depends on that local time.
+#
+# To stay deterministic:
+#   - Slots that must be OUTSIDE the off-peak window are given a duration
+#     LONGER than the window itself (default window = 6h, so any 7h slot
+#     cannot possibly be contained, whatever the time of day).
+#   - Slots that must be INSIDE the window are pinned to the window's
+#     actual local clock times (e.g. 23:30 + 4h), as in the off-peak tests.
+# ===========================================================================
+
+OUTSIDE_SPAN = timedelta(hours=7)   # > 6h off-peak window => always outside
+
+
+class TestFindRelevantExtraDispatch:
 
     def setup_method(self):
         self.client = make_client()
@@ -503,41 +631,92 @@ class TestFindActiveExtraDispatch:
 
     def test_returns_none_when_no_dispatches(self):
         self._patch_dispatches([])
-        assert self.client.find_active_extra_dispatch() is None
+        assert self.client.find_relevant_extra_dispatch() is None
 
-    def test_returns_none_for_future_dispatch(self):
+    def test_returns_active_dispatch(self):
         now = datetime.now(timezone.utc)
-        self._patch_dispatches([make_dispatch(now + timedelta(hours=2),
-                                              now + timedelta(hours=3))])
-        assert self.client.find_active_extra_dispatch() is None
+        start, end = now - timedelta(hours=1), now - timedelta(hours=1) + OUTSIDE_SPAN
+        self._patch_dispatches([make_dispatch(start, end)])
+        result = self.client.find_relevant_extra_dispatch()
+        assert result is not None
+        assert result["end"] > now
+
+    def test_returns_upcoming_dispatch(self):
+        """
+        Behaviour change from find_active_extra_dispatch: a future window is
+        now returned so the Solis slot can be written proactively.
+        """
+        now = datetime.now(timezone.utc)
+        start = now + timedelta(hours=1)
+        self._patch_dispatches([make_dispatch(start, start + OUTSIDE_SPAN)])
+        result = self.client.find_relevant_extra_dispatch()
+        assert result is not None
+        assert result["start"] > now
 
     def test_returns_none_for_past_dispatch(self):
         now = datetime.now(timezone.utc)
-        self._patch_dispatches([make_dispatch(now - timedelta(hours=3),
+        self._patch_dispatches([make_dispatch(now - timedelta(hours=9),
                                               now - timedelta(hours=1))])
-        assert self.client.find_active_extra_dispatch() is None
+        assert self.client.find_relevant_extra_dispatch() is None
 
-    def test_returns_none_for_active_in_window_dispatch(self):
-        """
-        A dispatch that is currently active but falls entirely within the
-        standard off-peak window should be ignored.
-        """
+    def test_returns_none_for_dispatch_inside_offpeak(self):
+        """An upcoming dispatch wholly inside 23:30-05:30 must be ignored."""
         now   = datetime.now(timezone.utc)
-        start = now.replace(hour=23, minute=30, second=0, microsecond=0)
-        if start > now:
-            start -= timedelta(days=1)
-        end = start + timedelta(hours=4)
-        self._patch_dispatches([make_dispatch(start, end)])
-        assert self.client.find_active_extra_dispatch() is None
+        start = local_dt(23, 30)
+        if start + timedelta(hours=4) < now:   # ensure the window hasn't fully passed
+            start += timedelta(days=1)
+        self._patch_dispatches([make_dispatch(start, start + timedelta(hours=4))])
+        assert self.client.find_relevant_extra_dispatch() is None
+
+    def test_back_to_back_chunks_returned_as_single_merged_window(self):
+        """The core fix: contiguous chunks come back as one window."""
+        now    = datetime.now(timezone.utc)
+        s1     = now + timedelta(hours=1)
+        middle = s1 + timedelta(hours=3, minutes=30)
+        e2     = s1 + OUTSIDE_SPAN
+        self._patch_dispatches([
+            make_dispatch(s1, middle),
+            make_dispatch(middle, e2),
+        ])
+        result = self.client.find_relevant_extra_dispatch()
+        assert result is not None
+        assert result["start"] == s1
+        assert result["end"]   == e2
+        assert result["boundaries"] == [middle]
+
+    def test_result_always_contains_boundaries_key(self):
+        now = datetime.now(timezone.utc)
+        self._patch_dispatches([make_dispatch(now, now + OUTSIDE_SPAN)])
+        result = self.client.find_relevant_extra_dispatch()
+        assert "boundaries" in result
+        assert result["boundaries"] == []
+
+    def test_earliest_relevant_window_returned_first(self):
+        now = datetime.now(timezone.utc)
+        early_start = now + timedelta(hours=1)
+        late_start  = now + timedelta(hours=12)
+        self._patch_dispatches([
+            make_dispatch(late_start,  late_start  + OUTSIDE_SPAN),
+            make_dispatch(early_start, early_start + OUTSIDE_SPAN),
+        ])
+        result = self.client.find_relevant_extra_dispatch()
+        assert result["start"] == early_start
 
     def test_skips_malformed_dispatch(self):
         self._patch_dispatches([{"bad": "data"}])
-        assert self.client.find_active_extra_dispatch() is None
+        assert self.client.find_relevant_extra_dispatch() is None
 
-    def test_skips_malformed_and_continues(self):
-        self._patch_dispatches([{"bad": "data"}, {"also": "bad"}])
-        result = self.client.find_active_extra_dispatch()
-        assert result is None
+    def test_skips_malformed_and_returns_valid(self):
+        """A malformed entry must not prevent a valid one being found."""
+        now   = datetime.now(timezone.utc)
+        start = now + timedelta(hours=1)
+        self._patch_dispatches([
+            {"bad": "data"},
+            make_dispatch(start, start + OUTSIDE_SPAN),
+        ])
+        result = self.client.find_relevant_extra_dispatch()
+        assert result is not None
+        assert result["start"] == start
 
 
 # ===========================================================================
@@ -813,206 +992,388 @@ class TestClearChargeSlot:
 # ===========================================================================
 # ChargeSyncApp._poll  (full orchestration, mocked clients)
 # ===========================================================================
+#
+# The app now writes the Solis slot PROACTIVELY: a window returned by
+# find_relevant_extra_dispatch may be upcoming rather than active, and is
+# written to the inverter immediately so the inverter's own clock opens the
+# charge with no polling-latency gap. State attributes reflect this:
+# _slot_written / _written_start / _written_end (plus _boundaries, the
+# internal chunk joins of the merged window, used by the adaptive sleep).
+# ===========================================================================
 
-def make_app() -> tuple[ChargeSyncApp, MagicMock, MagicMock]:
+def make_app(poll_interval: int = 60) -> tuple[ChargeSyncApp, MagicMock, MagicMock]:
     octopus = MagicMock(spec=OctopusClient)
     solis   = MagicMock(spec=SolisClient)
-    solis.set_charge_slot.return_value        = True
-    solis.clear_charge_slot.return_value      = True
+    solis.set_charge_slot.return_value          = True
+    solis.clear_charge_slot.return_value        = True
     solis.get_battery_charge_power.return_value = None
-    return ChargeSyncApp(octopus=octopus, solis=solis, poll_interval=60), octopus, solis
+    return ChargeSyncApp(octopus=octopus, solis=solis,
+                         poll_interval=poll_interval), octopus, solis
+
+
+def make_window(start_offset_min: int, end_offset_min: int,
+                boundaries_offset_min: list[int] | None = None) -> dict:
+    """Build a merged-window dict as find_relevant_extra_dispatch returns it."""
+    now = datetime.now(timezone.utc)
+    return {
+        "start":      now + timedelta(minutes=start_offset_min),
+        "end":        now + timedelta(minutes=end_offset_min),
+        "boundaries": [now + timedelta(minutes=m)
+                       for m in (boundaries_offset_min or [])],
+    }
+
+
+def mark_written(app: ChargeSyncApp, window: dict) -> None:
+    """Put the app into the state it would be in after writing this window."""
+    app._slot_written  = True
+    app._written_start = window["start"]
+    app._written_end   = window["end"]
+    app._boundaries    = list(window["boundaries"])
 
 
 class TestChargeSyncAppPoll:
 
-    def _dispatch(self, minutes_ahead: int = 30) -> dict:
-        now = datetime.now(timezone.utc)
-        return {"start": now - timedelta(minutes=5),
-                "end":   now + timedelta(minutes=minutes_ahead),
-                "raw":   {}}
+    # --- no dispatch ---
 
-    def test_no_dispatch_no_slot_active_does_nothing(self):
+    def test_no_dispatch_nothing_written_does_nothing(self):
         app, octopus, solis = make_app()
-        octopus.find_active_extra_dispatch.return_value = None
+        octopus.find_relevant_extra_dispatch.return_value = None
         app._poll()
         solis.set_charge_slot.assert_not_called()
         solis.clear_charge_slot.assert_not_called()
 
-    def test_no_dispatch_clears_slot_when_active(self):
+    def test_no_dispatch_clears_slot_when_written(self):
         app, octopus, solis = make_app()
-        app._slot_active = True
-        octopus.find_active_extra_dispatch.return_value = None
+        mark_written(app, make_window(-5, 30))
+        octopus.find_relevant_extra_dispatch.return_value = None
         app._poll()
         solis.clear_charge_slot.assert_called_once()
 
-    def test_slot_inactive_after_successful_clear(self):
+    def test_state_reset_after_successful_clear(self):
         app, octopus, solis = make_app()
-        app._slot_active = True
-        octopus.find_active_extra_dispatch.return_value = None
+        mark_written(app, make_window(-5, 30, [10]))
+        octopus.find_relevant_extra_dispatch.return_value = None
         app._poll()
-        assert app._slot_active  is False
-        assert app._active_start is None
-        assert app._active_end   is None
+        assert app._slot_written  is False
+        assert app._written_start is None
+        assert app._written_end   is None
+        assert app._boundaries    == []
 
-    def test_slot_remains_active_if_clear_fails(self):
+    def test_slot_remains_written_if_clear_fails(self):
         app, octopus, solis = make_app()
-        app._slot_active = True
+        mark_written(app, make_window(-5, 30))
         solis.clear_charge_slot.return_value = False
-        octopus.find_active_extra_dispatch.return_value = None
+        octopus.find_relevant_extra_dispatch.return_value = None
         app._poll()
-        assert app._slot_active is True
+        assert app._slot_written is True
 
-    def test_new_dispatch_sets_charge_slot(self):
+    # --- active dispatch ---
+
+    def test_active_dispatch_sets_charge_slot(self):
         app, octopus, solis = make_app()
-        octopus.find_active_extra_dispatch.return_value = self._dispatch()
+        octopus.find_relevant_extra_dispatch.return_value = make_window(-5, 30)
         app._poll()
         solis.set_charge_slot.assert_called_once()
 
-    def test_slot_marked_active_after_successful_set(self):
+    def test_state_recorded_after_successful_set(self):
         app, octopus, solis = make_app()
-        dispatch = self._dispatch()
-        octopus.find_active_extra_dispatch.return_value = dispatch
+        window = make_window(-5, 30, [10])
+        octopus.find_relevant_extra_dispatch.return_value = window
         app._poll()
-        assert app._slot_active  is True
-        assert app._active_start == dispatch["start"]
-        assert app._active_end   == dispatch["end"]
+        assert app._slot_written  is True
+        assert app._written_start == window["start"]
+        assert app._written_end   == window["end"]
+        assert app._boundaries    == window["boundaries"]
 
-    def test_slot_not_marked_active_if_set_fails(self):
+    def test_state_not_recorded_if_set_fails(self):
         app, octopus, solis = make_app()
         solis.set_charge_slot.return_value = False
-        octopus.find_active_extra_dispatch.return_value = self._dispatch()
+        octopus.find_relevant_extra_dispatch.return_value = make_window(-5, 30)
         app._poll()
-        assert app._slot_active is False
+        assert app._slot_written is False
 
-    def test_already_active_same_end_does_not_call_set_again(self):
+    # --- upcoming dispatch (proactive writing) ---
+
+    def test_upcoming_dispatch_written_proactively(self):
+        """
+        Key behaviour change: a window that has NOT yet started must be
+        written immediately, so the inverter starts the charge on time even
+        if no poll lands near the start.
+        """
         app, octopus, solis = make_app()
-        dispatch = self._dispatch()
-        app._slot_active  = True
-        app._active_start = dispatch["start"]
-        app._active_end   = dispatch["end"]
-        octopus.find_active_extra_dispatch.return_value = dispatch
+        window = make_window(30, 90)
+        octopus.find_relevant_extra_dispatch.return_value = window
+        app._poll()
+        solis.set_charge_slot.assert_called_once_with(window["start"], window["end"])
+        assert app._slot_written is True
+
+    def test_upcoming_dispatch_more_than_24h_away_is_deferred(self):
+        """
+        Solis slots are HH:MM only — writing a window >= ~24h away would
+        activate at the wrong day's occurrence of that time.
+        """
+        app, octopus, solis = make_app()
+        octopus.find_relevant_extra_dispatch.return_value = make_window(25 * 60, 26 * 60)
+        app._poll()
+        solis.set_charge_slot.assert_not_called()
+        assert app._slot_written is False
+
+    def test_deferred_far_future_dispatch_clears_stale_written_slot(self):
+        """
+        If the plan changes so the only remaining window is >24h away, any
+        previously written slot must be cleared, not left on the inverter.
+        """
+        app, octopus, solis = make_app()
+        mark_written(app, make_window(-5, 30))
+        octopus.find_relevant_extra_dispatch.return_value = make_window(25 * 60, 26 * 60)
+        app._poll()
+        solis.clear_charge_slot.assert_called_once()
+        assert app._slot_written is False
+
+    # --- window changes while written ---
+
+    def test_unchanged_window_does_not_call_set_again(self):
+        app, octopus, solis = make_app()
+        window = make_window(-5, 30)
+        mark_written(app, window)
+        octopus.find_relevant_extra_dispatch.return_value = window
         app._poll()
         solis.set_charge_slot.assert_not_called()
 
-    def test_already_active_changed_end_updates_slot(self):
+    def test_changed_end_updates_slot(self):
+        """e.g. Octopus extends the window by appending another chunk."""
         app, octopus, solis = make_app()
-        dispatch     = self._dispatch(minutes_ahead=30)
-        new_dispatch = {**dispatch, "end": dispatch["end"] + timedelta(minutes=15)}
-        app._slot_active  = True
-        app._active_start = dispatch["start"]
-        app._active_end   = dispatch["end"]
-        octopus.find_active_extra_dispatch.return_value = new_dispatch
+        window = make_window(-5, 30)
+        mark_written(app, window)
+        extended = {**window, "end": window["end"] + timedelta(minutes=30),
+                    "boundaries": [window["end"]]}
+        octopus.find_relevant_extra_dispatch.return_value = extended
         app._poll()
         solis.set_charge_slot.assert_called_once()
-        assert app._active_start == new_dispatch["start"]
-        assert app._active_end   == new_dispatch["end"]
+        assert app._written_end == extended["end"]
+        assert app._boundaries  == extended["boundaries"]
+
+    def test_changed_end_shrink_updates_slot(self):
+        """e.g. Octopus drops the second chunk of a merged window mid-slot."""
+        app, octopus, solis = make_app()
+        window = make_window(-5, 55, [25])
+        mark_written(app, window)
+        shrunk = {**window, "end": window["boundaries"][0], "boundaries": []}
+        octopus.find_relevant_extra_dispatch.return_value = shrunk
+        app._poll()
+        solis.set_charge_slot.assert_called_once()
+        assert app._written_end == shrunk["end"]
+        assert app._boundaries  == []
+
+    def test_changed_start_updates_slot(self):
+        app, octopus, solis = make_app()
+        window = make_window(-10, 30)
+        mark_written(app, window)
+        moved = {**window, "start": window["start"] + timedelta(minutes=5)}
+        octopus.find_relevant_extra_dispatch.return_value = moved
+        app._poll()
+        solis.set_charge_slot.assert_called_once()
+        assert app._written_start == moved["start"]
+
+    def test_changed_window_set_fails_does_not_update_state(self):
+        """If the rewrite fails, tracked times must not advance (next poll retries)."""
+        app, octopus, solis = make_app()
+        solis.set_charge_slot.return_value = False
+        window = make_window(-10, 30)
+        mark_written(app, window)
+        moved = {**window, "start": window["start"] + timedelta(minutes=5)}
+        octopus.find_relevant_extra_dispatch.return_value = moved
+        app._poll()
+        assert app._written_start == window["start"]
+        assert app._written_end   == window["end"]
+
+    def test_boundaries_refreshed_when_window_unchanged(self):
+        """
+        Chunk joins can move without the overall window changing; the stored
+        boundaries (used by the adaptive sleep) must track the latest ones.
+        """
+        app, octopus, solis = make_app()
+        window = make_window(-5, 55, [25])
+        mark_written(app, window)
+        new_boundary = window["start"] + timedelta(minutes=40)
+        octopus.find_relevant_extra_dispatch.return_value = {**window,
+                                                             "boundaries": [new_boundary]}
+        app._poll()
+        solis.set_charge_slot.assert_not_called()
+        assert app._boundaries == [new_boundary]
+
+    # --- lifecycle ---
 
     def test_full_dispatch_lifecycle(self):
-        """Simulate: detect -> active -> still active -> ends -> cleared."""
+        """Simulate: upcoming -> written -> active -> unchanged -> ends -> cleared."""
         app, octopus, solis = make_app()
-        dispatch = self._dispatch()
+        window = make_window(10, 40)
 
-        octopus.find_active_extra_dispatch.return_value = dispatch
+        # Poll 1: upcoming window detected and written proactively.
+        octopus.find_relevant_extra_dispatch.return_value = window
         app._poll()
-        assert app._slot_active  is True
-        assert app._active_start == dispatch["start"]
-        assert app._active_end   == dispatch["end"]
+        assert app._slot_written is True
         solis.set_charge_slot.assert_called_once()
 
+        # Poll 2: window unchanged (now notionally active) — no rewrite.
         app._poll()
         solis.set_charge_slot.assert_called_once()  # still only once
 
-        octopus.find_active_extra_dispatch.return_value = None
+        # Poll 3: window has ended / disappeared from the plan — cleared.
+        octopus.find_relevant_extra_dispatch.return_value = None
         app._poll()
         solis.clear_charge_slot.assert_called_once()
-        assert app._slot_active  is False
-        assert app._active_start is None
-        assert app._active_end   is None
+        assert app._slot_written  is False
+        assert app._written_start is None
+        assert app._written_end   is None
 
-    def test_already_active_changed_start_updates_slot(self):
-        """If only the dispatch start time changes, the Solis slot must be updated."""
-        app, octopus, solis = make_app()
-        now = datetime.now(timezone.utc)
-        original   = {"start": now - timedelta(minutes=10),
-                      "end":   now + timedelta(minutes=30), "raw": {}}
-        rescheduled = {"start": now - timedelta(minutes=5),   # start moved forward
-                       "end":   original["end"], "raw": {}}
-        app._slot_active  = True
-        app._active_start = original["start"]
-        app._active_end   = original["end"]
-        octopus.find_active_extra_dispatch.return_value = rescheduled
-        app._poll()
-        solis.set_charge_slot.assert_called_once()
-        assert app._active_start == rescheduled["start"]
-        assert app._active_end   == rescheduled["end"]
-
-    def test_already_active_unchanged_times_does_not_update_slot(self):
-        """No API call when both start and end are identical to what Solis already has."""
-        app, octopus, solis = make_app()
-        dispatch = self._dispatch()
-        app._slot_active  = True
-        app._active_start = dispatch["start"]
-        app._active_end   = dispatch["end"]
-        octopus.find_active_extra_dispatch.return_value = dispatch
-        app._poll()
-        solis.set_charge_slot.assert_not_called()
-
-    def test_already_active_changed_start_set_fails_does_not_update_state(self):
-        """If set_charge_slot fails on a start-time change, tracked times must not advance."""
-        app, octopus, solis = make_app()
-        solis.set_charge_slot.return_value = False
-        now = datetime.now(timezone.utc)
-        original   = {"start": now - timedelta(minutes=10),
-                      "end":   now + timedelta(minutes=30), "raw": {}}
-        rescheduled = {"start": now - timedelta(minutes=5),
-                       "end":   original["end"], "raw": {}}
-        app._slot_active  = True
-        app._active_start = original["start"]
-        app._active_end   = original["end"]
-        octopus.find_active_extra_dispatch.return_value = rescheduled
-        app._poll()
-        # State must remain at the original times so the next poll retries.
-        assert app._active_start == original["start"]
-        assert app._active_end   == original["end"]
+    # --- battery power logging ---
 
     def test_battery_power_logged_when_dispatch_active(self):
-        """get_battery_charge_power should be called on every poll with an active dispatch."""
         app, octopus, solis = make_app()
         solis.get_battery_charge_power.return_value = 2500.0
-        octopus.find_active_extra_dispatch.return_value = self._dispatch()
+        octopus.find_relevant_extra_dispatch.return_value = make_window(-5, 30)
         app._poll()
         app._poll()
         assert solis.get_battery_charge_power.call_count == 2
 
+    def test_battery_power_not_logged_for_upcoming_window(self):
+        """No charging is happening yet, so there is nothing to report."""
+        app, octopus, solis = make_app()
+        octopus.find_relevant_extra_dispatch.return_value = make_window(30, 90)
+        app._poll()
+        solis.get_battery_charge_power.assert_not_called()
+
     def test_battery_power_logged_after_slot_cleared(self):
-        """get_battery_charge_power should be called once when a slot is successfully cleared."""
         app, octopus, solis = make_app()
         solis.get_battery_charge_power.return_value = 0.0
-        app._slot_active = True
-        octopus.find_active_extra_dispatch.return_value = None
+        mark_written(app, make_window(-35, -1))
+        octopus.find_relevant_extra_dispatch.return_value = None
         app._poll()
         solis.get_battery_charge_power.assert_called_once()
 
-    def test_battery_power_not_logged_when_no_dispatch_and_slot_inactive(self):
-        """get_battery_charge_power should not be called when there is nothing to report."""
+    def test_battery_power_not_logged_when_no_dispatch_and_nothing_written(self):
         app, octopus, solis = make_app()
-        octopus.find_active_extra_dispatch.return_value = None
+        octopus.find_relevant_extra_dispatch.return_value = None
         app._poll()
         solis.get_battery_charge_power.assert_not_called()
 
     def test_battery_power_not_logged_if_clear_fails(self):
-        """get_battery_charge_power should not be called if clear_charge_slot fails."""
         app, octopus, solis = make_app()
-        app._slot_active = True
+        mark_written(app, make_window(-35, -1))
         solis.clear_charge_slot.return_value = False
-        octopus.find_active_extra_dispatch.return_value = None
+        octopus.find_relevant_extra_dispatch.return_value = None
         app._poll()
         solis.get_battery_charge_power.assert_not_called()
 
     def test_battery_power_exception_does_not_break_poll(self):
-        """An unexpected exception from get_battery_charge_power must not propagate."""
         app, octopus, solis = make_app()
         solis.get_battery_charge_power.side_effect = RuntimeError("unexpected API response")
-        octopus.find_active_extra_dispatch.return_value = self._dispatch()
+        octopus.find_relevant_extra_dispatch.return_value = make_window(-5, 30)
         # Should complete without raising
         app._poll()
+
+
+# ===========================================================================
+# ChargeSyncApp._next_sleep  (adaptive sleep around window boundaries)
+# ===========================================================================
+
+class TestNextSleep:
+
+    def test_returns_poll_interval_when_nothing_written(self):
+        app, _, _ = make_app(poll_interval=180)
+        assert app._next_sleep() == 180
+
+    def test_returns_poll_interval_when_all_boundaries_far_away(self):
+        """Start/boundary/end all further than poll_interval -> normal cadence."""
+        app, _, _ = make_app(poll_interval=180)
+        mark_written(app, make_window(10, 70, [40]))
+        assert app._next_sleep() == 180
+
+    def test_wakes_just_after_imminent_start(self):
+        """Verify the dispatch still exists just after the written start."""
+        app, _, _ = make_app(poll_interval=180)
+        window = make_window(0, 60)
+        window["start"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+        mark_written(app, window)
+        sleep = app._next_sleep()
+        assert 30 <= sleep <= 30 + ChargeSyncApp.BOUNDARY_WAKE_DELAY_S + 2
+
+    def test_wakes_just_after_imminent_end(self):
+        """Clear the slot promptly after the window ends."""
+        app, _, _ = make_app(poll_interval=180)
+        window = make_window(-30, 0)
+        window["end"] = datetime.now(timezone.utc) + timedelta(seconds=60)
+        mark_written(app, window)
+        sleep = app._next_sleep()
+        assert 60 <= sleep <= 60 + ChargeSyncApp.BOUNDARY_WAKE_DELAY_S + 2
+
+    def test_wakes_just_after_imminent_chunk_boundary(self):
+        """Re-verify the remainder of a merged window at each chunk join."""
+        app, _, _ = make_app(poll_interval=180)
+        window = make_window(-10, 20)
+        boundary = datetime.now(timezone.utc) + timedelta(seconds=45)
+        window["boundaries"] = [boundary]
+        mark_written(app, window)
+        sleep = app._next_sleep()
+        assert 45 <= sleep <= 45 + ChargeSyncApp.BOUNDARY_WAKE_DELAY_S + 2
+
+    def test_earliest_upcoming_boundary_wins(self):
+        app, _, _ = make_app(poll_interval=180)
+        now = datetime.now(timezone.utc)
+        window = make_window(-10, 3)                       # end in 3 min
+        window["boundaries"] = [now + timedelta(seconds=40)]  # boundary sooner
+        mark_written(app, window)
+        sleep = app._next_sleep()
+        assert sleep < 60   # boundary wake, not the 3-minute end
+
+    def test_minimum_sleep_floor_applies(self):
+        """A boundary a second away must not cause a near-zero sleep."""
+        app, _, _ = make_app(poll_interval=180)
+        window = make_window(-10, 20)
+        window["boundaries"] = [datetime.now(timezone.utc) + timedelta(seconds=1)]
+        mark_written(app, window)
+        assert app._next_sleep() == ChargeSyncApp.MIN_SLEEP_S
+
+    def test_past_boundaries_ignored(self):
+        """Already-passed start/boundaries must not produce a wake."""
+        app, _, _ = make_app(poll_interval=180)
+        now = datetime.now(timezone.utc)
+        window = make_window(-30, 60)
+        window["boundaries"] = [now - timedelta(minutes=10)]
+        mark_written(app, window)
+        assert app._next_sleep() == 180
+
+    def test_window_fully_passed_returns_poll_interval(self):
+        app, _, _ = make_app(poll_interval=180)
+        mark_written(app, make_window(-60, -5))
+        assert app._next_sleep() == 180
+
+    def test_sleep_never_exceeds_poll_interval(self):
+        """Adaptive wakes only ever shorten the sleep, never lengthen it."""
+        app, _, _ = make_app(poll_interval=60)
+        mark_written(app, make_window(2, 90))   # start in 2 min > 60s interval
+        assert app._next_sleep() <= 60
+
+
+# ===========================================================================
+# ChargeSyncApp.__init__  (configuration guards)
+# ===========================================================================
+
+class TestChargeSyncAppInit:
+
+    def test_poll_interval_floor_enforced(self):
+        """Intervals below 60s are raised to 60s to limit Octopus API usage."""
+        app, _, _ = make_app(poll_interval=10)
+        assert app.poll_interval == 60
+
+    def test_poll_interval_above_floor_unchanged(self):
+        app, _, _ = make_app(poll_interval=300)
+        assert app.poll_interval == 300
+
+    def test_initial_state_is_nothing_written(self):
+        app, _, _ = make_app()
+        assert app._slot_written  is False
+        assert app._written_start is None
+        assert app._written_end   is None
+        assert app._boundaries    == []

@@ -56,22 +56,73 @@ class OctopusClient:
     # Public interface
     # ------------------------------------------------------------------
 
-    def find_active_extra_dispatch(self) -> dict | None:
+    def find_relevant_extra_dispatch(self) -> dict | None:
         """
-        Return the first dispatch that is currently active and falls outside
-        the standard off-peak window, or None.
+        Return the currently active OR next upcoming merged dispatch window
+        that falls outside the standard off-peak window, or None.
+
+        Octopus frequently splits one continuous charging period into
+        contiguous 30-minute chunks (settlement periods). Those chunks are
+        merged here into a single window so callers see e.g. 12:30-13:30
+        rather than 12:30-13:00 followed by 13:00-13:30.
+
+        Upcoming (not yet started) windows are returned as well as active
+        ones, so the caller can write the charge slot to the inverter in
+        advance and let the inverter's own clock start the charge with no
+        polling-latency gap.
+
+        Returns a dict:
+            start      - aware datetime (UTC), merged window start
+            end        - aware datetime (UTC), merged window end
+            boundaries - list of aware datetimes marking the internal joins
+                         between the original chunks. These are the moments
+                         at which Octopus is most likely to have rescheduled
+                         (a future chunk can be shortened or dropped), so the
+                         caller can re-poll shortly after each one.
         """
         now = datetime.now(timezone.utc)
+        slots: list[tuple[datetime, datetime]] = []
         for d in self._get_planned_dispatches():
             try:
-                start = self._parse_dt(d["start"])
-                end   = self._parse_dt(d["end"])
+                slots.append((self._parse_dt(d["start"]), self._parse_dt(d["end"])))
             except (KeyError, ValueError) as exc:
                 self._debug(f"Skipping malformed dispatch: {exc}")
-                continue
-            if start <= now <= end and self._is_outside_offpeak(start, end):
-                return {"start": start, "end": end, "raw": d}
+
+        for win in self._merge_dispatches(slots):
+            if win["end"] > now and self._is_outside_offpeak(win["start"], win["end"]):
+                self._debug(
+                    f"Relevant extra dispatch window: "
+                    f"{self._local_str(win['start'].isoformat())} -> "
+                    f"{self._local_str(win['end'].isoformat())} "
+                    f"({len(win['boundaries'])} internal boundary(ies))"
+                )
+                return win
         return None
+
+    @staticmethod
+    def _merge_dispatches(slots: list[tuple[datetime, datetime]],
+                          gap_tolerance_s: int = 60) -> list[dict]:
+        """
+        Merge back-to-back or overlapping dispatch slots into single windows.
+
+        Slots whose gap is <= gap_tolerance_s are treated as one continuous
+        window (Octopus occasionally leaves a sliver between adjacent slots).
+
+        Returns a list of dicts sorted by start time, each with:
+            start, end  - merged window endpoints
+            boundaries  - datetimes where the original chunks joined
+        """
+        merged: list[dict] = []
+        for start, end in sorted(slots):
+            if merged and (start - merged[-1]["end"]).total_seconds() <= gap_tolerance_s:
+                if end > merged[-1]["end"]:
+                    # Record the join point before extending the window.
+                    merged[-1]["boundaries"].append(merged[-1]["end"])
+                    merged[-1]["end"] = end
+                # If the slot is entirely contained, nothing to do.
+            else:
+                merged.append({"start": start, "end": end, "boundaries": []})
+        return merged
 
     # ------------------------------------------------------------------
     # Private helpers
