@@ -11,7 +11,10 @@ class OctopusClient:
     (outside standard off-peak) slots for Intelligent Go customers.
     """
 
-    GRAPHQL_URL = "https://api.octopus.energy/v1/graphql/"
+    # OLD URL
+    # GRAPHQL_URL = "https://api.octopus.energy/v1/graphql/"
+    # Oct 2026 URL change
+    GRAPHQL_URL = "https://api.oegb-kraken.energy/v1/graphql/"
 
     PLANNED_DISPATCHES_QUERY = """
     query PlannedDispatches($deviceId: String!) {
